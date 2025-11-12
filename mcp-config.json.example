@@ -1,0 +1,73 @@
+{
+  "name": "playwright-mcp",
+  "version": "1.0.0",
+  "description": "Microsoft Playwright MCP Server",
+  "transport": {
+    "type": "stdio",
+    "command": ["npx", "-y", "@playwright/mcp-server"],
+    "env": {}
+  },
+  "tools": [
+    {
+      "name": "navigate",
+      "description": "Navigate to a URL",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The URL to navigate to"
+          }
+        },
+        "required": ["url"]
+      }
+    },
+    {
+      "name": "click",
+      "description": "Click on an element",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "selector": {
+            "type": "string",
+            "description": "CSS selector for the element"
+          }
+        },
+        "required": ["selector"]
+      }
+    },
+    {
+      "name": "fill",
+      "description": "Fill an input field",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "selector": {
+            "type": "string",
+            "description": "CSS selector for the input field"
+          },
+          "value": {
+            "type": "string",
+            "description": "Value to fill"
+          }
+        },
+        "required": ["selector", "value"]
+      }
+    },
+    {
+      "name": "screenshot",
+      "description": "Take a screenshot",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to save the screenshot"
+          }
+        },
+        "required": ["path"]
+      }
+    }
+  ]
+}
+

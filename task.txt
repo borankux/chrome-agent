@@ -1,0 +1,26 @@
+# Example Task Specification
+# This file defines the task for the agent to execute
+
+Objective: Watch videos and interact with comments for 1 hour
+
+Loop: for 1 hour
+
+Subtask: Search and Find Videos
+- Search for keywords related to interesting topics
+- Filter results to find high quality videos
+- Select videos with good engagement metrics
+
+Subtask: Watch Video
+- Navigate to video page
+- Play the video
+- Wait for video to load and play
+
+Subtask: Interact with Comments
+- Scroll to comments section
+- Read top comments
+- Like or reply to interesting comments based on predefined rules
+
+Exception: authentication, intervention: true, retryable: false
+Exception: network timeout, intervention: false, retryable: true, maxretries: 3
+Exception: captcha, intervention: true, retryable: false
+
