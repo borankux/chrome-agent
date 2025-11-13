@@ -54,24 +54,27 @@ const (
 
 // Task represents a task record
 type Task struct {
-	ID        int64
-	Name      string
-	Status    TaskStatus
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID         int64
+	Name       string
+	Status     TaskStatus
+	FailReason string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 	ResultJSON string
 }
 
 // Subtask represents a subtask record
 type Subtask struct {
-	ID          int64
-	TaskID      int64
-	Name        string
-	Status      SubtaskStatus
-	CycleNumber int
-	ResultJSON  string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID           int64
+	TaskID       int64
+	Name         string
+	Status       SubtaskStatus
+	CycleNumber  int
+	RetryCount   int
+	MaxRetries   int
+	ResultJSON   string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // Loop represents a loop record
@@ -96,6 +99,15 @@ type Exception struct {
 	CreatedAt           time.Time
 }
 
+// StateSnapshot represents a browser/system state snapshot
+type StateSnapshot struct {
+	ID          int64
+	SubtaskID   int64
+	CycleNumber int
+	SnapshotData string // JSON of browser state (URL, cookies, localStorage, etc.)
+	CreatedAt   time.Time
+}
+
 // NewDB creates a new database connection
 func NewDB(path string) (*DB, error) {
 	db, err := sql.Open("sqlite3", path)
@@ -118,6 +130,7 @@ func (d *DB) initSchema() error {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'pending',
+		fail_reason TEXT,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		result_json TEXT
@@ -129,6 +142,8 @@ func (d *DB) initSchema() error {
 		name TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'pending',
 		cycle_number INTEGER NOT NULL DEFAULT 0,
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		max_retries INTEGER NOT NULL DEFAULT 3,
 		result_json TEXT,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -157,9 +172,19 @@ func (d *DB) initSchema() error {
 		FOREIGN KEY (subtask_id) REFERENCES subtasks(id)
 	);
 
+	CREATE TABLE IF NOT EXISTS state_snapshots (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		subtask_id INTEGER NOT NULL,
+		cycle_number INTEGER NOT NULL DEFAULT 0,
+		snapshot_data TEXT NOT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (subtask_id) REFERENCES subtasks(id)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_subtasks_task_id ON subtasks(task_id);
 	CREATE INDEX IF NOT EXISTS idx_loops_task_id ON loops(task_id);
 	CREATE INDEX IF NOT EXISTS idx_exceptions_subtask_id ON exceptions(subtask_id);
+	CREATE INDEX IF NOT EXISTS idx_state_snapshots_subtask_id ON state_snapshots(subtask_id);
 	`
 
 	_, err := d.db.Exec(schema)
@@ -192,6 +217,15 @@ func (d *DB) UpdateTaskStatus(taskID int64, status TaskStatus) error {
 	return err
 }
 
+// UpdateTaskStatusWithReason updates task status and fail reason
+func (d *DB) UpdateTaskStatusWithReason(taskID int64, status TaskStatus, failReason string) error {
+	_, err := d.db.Exec(
+		"UPDATE tasks SET status = ?, fail_reason = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		status, failReason, taskID,
+	)
+	return err
+}
+
 // UpdateTaskResult updates task result
 func (d *DB) UpdateTaskResult(taskID int64, result interface{}) error {
 	resultJSON, err := json.Marshal(result)
@@ -208,12 +242,16 @@ func (d *DB) UpdateTaskResult(taskID int64, result interface{}) error {
 // GetTask retrieves a task by ID
 func (d *DB) GetTask(taskID int64) (*Task, error) {
 	var task Task
+	var failReason sql.NullString
 	err := d.db.QueryRow(
-		"SELECT id, name, status, created_at, updated_at, result_json FROM tasks WHERE id = ?",
+		"SELECT id, name, status, fail_reason, created_at, updated_at, result_json FROM tasks WHERE id = ?",
 		taskID,
-	).Scan(&task.ID, &task.Name, &task.Status, &task.CreatedAt, &task.UpdatedAt, &task.ResultJSON)
+	).Scan(&task.ID, &task.Name, &task.Status, &failReason, &task.CreatedAt, &task.UpdatedAt, &task.ResultJSON)
 	if err != nil {
 		return nil, err
+	}
+	if failReason.Valid {
+		task.FailReason = failReason.String
 	}
 	return &task, nil
 }
@@ -221,7 +259,7 @@ func (d *DB) GetTask(taskID int64) (*Task, error) {
 // CreateSubtask creates a new subtask
 func (d *DB) CreateSubtask(taskID int64, name string, cycleNumber int) (int64, error) {
 	result, err := d.db.Exec(
-		"INSERT INTO subtasks (task_id, name, status, cycle_number) VALUES (?, ?, ?, ?)",
+		"INSERT INTO subtasks (task_id, name, status, cycle_number, retry_count, max_retries) VALUES (?, ?, ?, ?, 0, 3)",
 		taskID, name, SubtaskStatusPending, cycleNumber,
 	)
 	if err != nil {
@@ -255,7 +293,7 @@ func (d *DB) UpdateSubtaskResult(subtaskID int64, result interface{}) error {
 // GetSubtasksByTaskID retrieves all subtasks for a task
 func (d *DB) GetSubtasksByTaskID(taskID int64) ([]*Subtask, error) {
 	rows, err := d.db.Query(
-		"SELECT id, task_id, name, status, cycle_number, result_json, created_at, updated_at FROM subtasks WHERE task_id = ? ORDER BY cycle_number, id",
+		"SELECT id, task_id, name, status, cycle_number, retry_count, max_retries, result_json, created_at, updated_at FROM subtasks WHERE task_id = ? ORDER BY cycle_number, id",
 		taskID,
 	)
 	if err != nil {
@@ -266,9 +304,13 @@ func (d *DB) GetSubtasksByTaskID(taskID int64) ([]*Subtask, error) {
 	var subtasks []*Subtask
 	for rows.Next() {
 		var subtask Subtask
-		err := rows.Scan(&subtask.ID, &subtask.TaskID, &subtask.Name, &subtask.Status, &subtask.CycleNumber, &subtask.ResultJSON, &subtask.CreatedAt, &subtask.UpdatedAt)
+		var resultJSON sql.NullString
+		err := rows.Scan(&subtask.ID, &subtask.TaskID, &subtask.Name, &subtask.Status, &subtask.CycleNumber, &subtask.RetryCount, &subtask.MaxRetries, &resultJSON, &subtask.CreatedAt, &subtask.UpdatedAt)
 		if err != nil {
 			return nil, err
+		}
+		if resultJSON.Valid {
+			subtask.ResultJSON = resultJSON.String
 		}
 		subtasks = append(subtasks, &subtask)
 	}
@@ -368,5 +410,59 @@ func (d *DB) GetUnresolvedExceptions() ([]*Exception, error) {
 		exceptions = append(exceptions, &ex)
 	}
 	return exceptions, rows.Err()
+}
+
+// IncrementSubtaskRetry increments retry count for a subtask
+func (d *DB) IncrementSubtaskRetry(subtaskID int64) error {
+	_, err := d.db.Exec(
+		"UPDATE subtasks SET retry_count = retry_count + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		subtaskID,
+	)
+	return err
+}
+
+// GetSubtask retrieves a subtask by ID
+func (d *DB) GetSubtask(subtaskID int64) (*Subtask, error) {
+	var subtask Subtask
+	var resultJSON sql.NullString
+	err := d.db.QueryRow(
+		"SELECT id, task_id, name, status, cycle_number, retry_count, max_retries, result_json, created_at, updated_at FROM subtasks WHERE id = ?",
+		subtaskID,
+	).Scan(&subtask.ID, &subtask.TaskID, &subtask.Name, &subtask.Status, &subtask.CycleNumber, &subtask.RetryCount, &subtask.MaxRetries, &resultJSON, &subtask.CreatedAt, &subtask.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if resultJSON.Valid {
+		subtask.ResultJSON = resultJSON.String
+	}
+	return &subtask, nil
+}
+
+// CreateStateSnapshot creates a state snapshot
+func (d *DB) CreateStateSnapshot(subtaskID int64, cycleNumber int, snapshotData string) (int64, error) {
+	result, err := d.db.Exec(
+		"INSERT INTO state_snapshots (subtask_id, cycle_number, snapshot_data) VALUES (?, ?, ?)",
+		subtaskID, cycleNumber, snapshotData,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+// GetLatestStateSnapshot retrieves the latest state snapshot for a subtask
+func (d *DB) GetLatestStateSnapshot(subtaskID int64) (*StateSnapshot, error) {
+	var snapshot StateSnapshot
+	err := d.db.QueryRow(
+		"SELECT id, subtask_id, cycle_number, snapshot_data, created_at FROM state_snapshots WHERE subtask_id = ? ORDER BY created_at DESC LIMIT 1",
+		subtaskID,
+	).Scan(&snapshot.ID, &snapshot.SubtaskID, &snapshot.CycleNumber, &snapshot.SnapshotData, &snapshot.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
 }
 

@@ -83,6 +83,11 @@ func (m *Manager) UpdateTaskStatus(status state.TaskStatus) error {
 	return m.db.UpdateTaskStatus(m.taskID, status)
 }
 
+// UpdateTaskStatusWithReason updates task status with fail reason
+func (m *Manager) UpdateTaskStatusWithReason(status state.TaskStatus, failReason string) error {
+	return m.db.UpdateTaskStatusWithReason(m.taskID, status, failReason)
+}
+
 // UpdateTaskResult updates task result
 func (m *Manager) UpdateTaskResult(result interface{}) error {
 	return m.db.UpdateTaskResult(m.taskID, result)
@@ -172,5 +177,25 @@ func (m *Manager) GetElapsedTime() (time.Duration, error) {
 		return 0, nil
 	}
 	return time.Since(loop.CreatedAt), nil
+}
+
+// IncrementSubtaskRetry increments retry count for a subtask
+func (m *Manager) IncrementSubtaskRetry(subtaskID int64) error {
+	return m.db.IncrementSubtaskRetry(subtaskID)
+}
+
+// GetSubtask retrieves a subtask by ID
+func (m *Manager) GetSubtask(subtaskID int64) (*state.Subtask, error) {
+	return m.db.GetSubtask(subtaskID)
+}
+
+// CreateStateSnapshot creates a state snapshot
+func (m *Manager) CreateStateSnapshot(subtaskID int64, cycleNumber int, snapshotData string) (int64, error) {
+	return m.db.CreateStateSnapshot(subtaskID, cycleNumber, snapshotData)
+}
+
+// GetLatestStateSnapshot retrieves the latest state snapshot for a subtask
+func (m *Manager) GetLatestStateSnapshot(subtaskID int64) (*state.StateSnapshot, error) {
+	return m.db.GetLatestStateSnapshot(subtaskID)
 }
 

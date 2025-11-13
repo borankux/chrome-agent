@@ -7,6 +7,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"chrome-agent/internal/llm"
+	"chrome-agent/internal/mcp"
+	"chrome-agent/pkg/logger"
 )
 
 // TaskSpec represents a parsed task specification
@@ -258,5 +262,50 @@ func FormatDuration(seconds float64) string {
 		return fmt.Sprintf("%.1f minutes", seconds/60)
 	}
 	return fmt.Sprintf("%.1f hours", seconds/3600)
+}
+
+// ParseTaskOrPlan parses task file and uses LLM planning if no subtasks are found
+func ParseTaskOrPlan(path string, llmCoord *llm.Coordinator, mcpClient *mcp.Client, log *logger.Logger) (*TaskSpec, error) {
+	// First, try to parse the task file
+	taskSpec, err := ParseTaskFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse task file: %w", err)
+	}
+
+	// If subtasks are already defined, use the parsed spec
+	if len(taskSpec.SubtaskRules) > 0 {
+		log.Info("Found %d manually defined subtasks, using parsed task specification", len(taskSpec.SubtaskRules))
+		return taskSpec, nil
+	}
+
+	// If no subtasks found but we have an objective, use LLM planning
+	if taskSpec.Objective == "" {
+		return nil, fmt.Errorf("no objective found in task file and no subtasks defined")
+	}
+
+	log.Info("No subtasks found in task file, using LLM to plan task from objective")
+	
+	// Create planner and plan the task
+	planner := NewPlanner(llmCoord, mcpClient, log)
+	plannedSpec, err := planner.PlanTask(taskSpec.Objective)
+	if err != nil {
+		log.Warn("LLM planning failed: %v, falling back to parsed task specification", err)
+		// Return the original spec (may have loop condition or exception rules)
+		return taskSpec, nil
+	}
+
+	// Merge any manually defined loop conditions or exception rules from the parsed file
+	if taskSpec.LoopCondition != nil && plannedSpec.LoopCondition == nil {
+		plannedSpec.LoopCondition = taskSpec.LoopCondition
+		log.Info("Using manually defined loop condition from task file")
+	}
+
+	if len(taskSpec.ExceptionRules) > 0 {
+		// Merge exception rules (manual ones take precedence)
+		plannedSpec.ExceptionRules = append(taskSpec.ExceptionRules, plannedSpec.ExceptionRules...)
+		log.Info("Merged %d manually defined exception rules", len(taskSpec.ExceptionRules))
+	}
+
+	return plannedSpec, nil
 }
 

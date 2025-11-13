@@ -1,17 +1,2 @@
-# Example Task Specification
-# This file defines the task for the agent to execute
-
-Objective: Navigate to a website and take a screenshot
-
-Subtask: Navigate to Example
-- Navigate to https://example.com
-- Wait for page to load
-
-Subtask: Capture Page
-- Take a screenshot of the page
-- Save screenshot with timestamp
-
-Exception: authentication, intervention: true, retryable: false
-Exception: network timeout, intervention: false, retryable: true, maxretries: 3
-Exception: captcha, intervention: true, retryable: false
+Objective, UseMCP, and Open Google And Search for 10 Movie Stars and find their Names, Networth and Age. Wait 30 seconds afte each serach.
 

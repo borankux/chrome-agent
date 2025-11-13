@@ -15,16 +15,30 @@ import (
 	"chrome-agent/internal/state"
 	"chrome-agent/internal/task"
 	"chrome-agent/pkg/logger"
+	"chrome-agent/pkg/tui"
 )
 
 func main() {
 	var (
-		taskFile    = flag.String("task", "task.txt", "Path to task specification file")
-		mcpConfig   = flag.String("mcp", "mcp-config.json", "Path to MCP configuration file")
-		dbPath      = flag.String("db", "agent.db", "Path to SQLite database file")
-		logLevel    = flag.String("log", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
+		taskFile  = flag.String("task", "task.txt", "Path to task specification file")
+		mcpConfig = flag.String("mcp", "mcp-config.json", "Path to MCP configuration file")
+		dbPath    = flag.String("db", "agent.db", "Path to SQLite database file")
+		logLevel  = flag.String("log", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
+		useTUI    = flag.Bool("tui", false, "Enable TUI mode")
 	)
 	flag.Parse()
+
+	// Initialize TUI if enabled
+	var tuiModel *tui.Model
+	if *useTUI {
+		var err error
+		tuiModel, err = tui.Start()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start TUI: %v\n", err)
+			os.Exit(1)
+		}
+		defer tuiModel.Stop()
+	}
 
 	// Initialize logger
 	var logLevelEnum logger.Level
@@ -39,6 +53,12 @@ func main() {
 		logLevelEnum = logger.INFO
 	}
 	log := logger.New(logLevelEnum, "agent")
+	
+	// Connect logger to TUI if enabled
+	if tuiModel != nil {
+		log.SetTUIBackend(tuiModel)
+		log.SetTUIEnabled(true)
+	}
 
 	log.Info("=== Chrome Agent Starting ===")
 
@@ -61,17 +81,17 @@ func main() {
 	} else {
 		log.Debug("MCP transport type: %s", mcpDef.Transport.Type)
 	}
-	
+
 	// Add timeout context for validation
 	validationDone := make(chan bool, 1)
 	var statusReport *mcp.StatusReport
 	var validationErr error
-	
+
 	go func() {
 		statusReport, validationErr = mcpClient.ValidateConnection()
 		validationDone <- true
 	}()
-	
+
 	select {
 	case <-validationDone:
 		if validationErr != nil {
@@ -97,6 +117,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate that tools are available
+	if statusReport.ToolsCount == 0 {
+		log.Error("MCP server has no available tools")
+		log.Error("Cannot proceed with task planning - tools are required")
+		log.Error("Please check your MCP server configuration and ensure tools are properly registered")
+		os.Exit(1)
+	}
+
+	log.Info("MCP server validated: %d tools available", statusReport.ToolsCount)
+
 	// Initialize state database
 	log.Info("Initializing database: %s", *dbPath)
 	db, err := state.NewDB(*dbPath)
@@ -114,17 +144,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load and parse task
+	// Load and parse task (with LLM planning if needed)
 	log.Info("Loading task from: %s", *taskFile)
-	taskSpec, err := task.ParseTaskFile(*taskFile)
+	taskSpec, err := task.ParseTaskOrPlan(*taskFile, llmCoord, mcpClient, log)
 	if err != nil {
-		log.Error("Failed to parse task file: %v", err)
+		log.Error("Failed to parse or plan task: %v", err)
 		os.Exit(1)
 	}
 
 	log.Info("Task objective: %s", taskSpec.Objective)
 	if taskSpec.LoopCondition != nil {
 		log.Info("Loop condition: %s", taskSpec.LoopCondition.Description)
+	}
+	log.Info("Number of subtasks: %d", len(taskSpec.SubtaskRules))
+	if len(taskSpec.ExceptionRules) > 0 {
+		log.Info("Exception rules: %d", len(taskSpec.ExceptionRules))
 	}
 
 	// Create task manager
@@ -178,21 +212,61 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Update TUI with initial task state
+	if tuiModel != nil {
+		spec := taskManager.GetSpec()
+		taskState := &tui.TaskState{
+			Objective:   spec.Objective,
+			Status:      "running",
+			IsLoopable:  taskManager.IsLoopable(),
+		}
+		if spec.LoopCondition != nil {
+			taskState.LoopType = spec.LoopCondition.Type
+			taskState.LoopTarget = spec.LoopCondition.TargetValue
+		}
+		tuiModel.SendUpdate(tui.TaskUpdateMsg{State: taskState})
+	}
+
 	// Execute task
 	var execErr error
 	if taskManager.IsLoopable() {
 		log.Info("Task is loopable, starting loop execution...")
 		loopManager := loop.NewManager(taskManager, executor, log)
+		if tuiModel != nil {
+			loopManager.SetTUIModel(tuiModel)
+		}
 		execErr = loopManager.ExecuteLoop()
 	} else {
 		log.Info("Executing single task...")
-		execErr = executeSingleTask(taskManager, executor, exceptionHandler, log)
+		execErr = executeSingleTask(taskManager, executor, exceptionHandler, log, tuiModel)
+	}
+	
+	// Update TUI with final status
+	if tuiModel != nil {
+		finalState := &tui.TaskState{
+			Objective: taskManager.GetSpec().Objective,
+			Status:    "completed",
+		}
+		if execErr != nil {
+			finalState.Status = "failed"
+		}
+		tuiModel.SendUpdate(tui.TaskUpdateMsg{State: finalState})
 	}
 
 	// Handle execution result
 	if execErr != nil {
 		log.Error("Task execution failed: %v", execErr)
-		if err := taskManager.UpdateTaskStatus(state.TaskStatusFailed); err != nil {
+		
+		// Print LLM token usage statistics even on failure
+		stats := printTokenStatistics(llmCoord, log)
+		
+		// Update TUI with stats
+		if tuiModel != nil {
+			tuiModel.SendUpdate(tui.StatsUpdateMsg{Stats: stats})
+		}
+		
+		// Check if it's a planning failure (non-recoverable)
+		if err := taskManager.UpdateTaskStatusWithReason(state.TaskStatusFailed, execErr.Error()); err != nil {
 			log.Error("Failed to update task status: %v", err)
 		}
 		os.Exit(1)
@@ -211,6 +285,9 @@ func main() {
 	if err == nil {
 		log.Info("Task ID: %d", taskRecord.ID)
 		log.Info("Task Status: %s", taskRecord.Status)
+		if taskRecord.FailReason != "" {
+			log.Info("Fail Reason: %s", taskRecord.FailReason)
+		}
 	}
 
 	subtasks, err := taskManager.GetSubtasks()
@@ -227,14 +304,74 @@ func main() {
 		log.Info("Subtasks: %d completed, %d failed, %d total", completed, failed, len(subtasks))
 	}
 
+	// Print LLM token usage statistics
+	stats := printTokenStatistics(llmCoord, log)
+	
+	// Update TUI with stats
+	if tuiModel != nil {
+		tuiModel.SendUpdate(tui.StatsUpdateMsg{Stats: stats})
+	}
+
 	// Disconnect MCP client
 	if err := mcpClient.Disconnect(); err != nil {
 		log.Error("Failed to disconnect MCP client: %v", err)
 	}
 }
 
-func executeSingleTask(taskManager *task.Manager, executor *task.Executor, exceptionHandler *exception.Handler, log *logger.Logger) error {
+// printTokenStatistics prints LLM token usage statistics and returns stats
+func printTokenStatistics(llmCoord *llm.Coordinator, log *logger.Logger) *tui.Stats {
+	log.Info("=== LLM Token Usage Statistics ===")
+	totalPrompt, totalCompletion, totalTokens, callCount, breakdown := llmCoord.GetTokenStatistics()
+	log.Info("Total LLM Calls: %d", callCount)
+	log.Info("Total Tokens: %d (Prompt: %d, Completion: %d)", totalTokens, totalPrompt, totalCompletion)
+	
+	if callCount > 0 {
+		log.Info("Breakdown by call type:")
+		typeStats := make(map[string]struct {
+			count int
+			prompt int
+			completion int
+			total int
+		})
+		
+		for _, usage := range breakdown {
+			stats := typeStats[usage.CallType]
+			stats.count++
+			stats.prompt += usage.PromptTokens
+			stats.completion += usage.CompletionTokens
+			stats.total += usage.TotalTokens
+			typeStats[usage.CallType] = stats
+		}
+		
+		for callType, stats := range typeStats {
+			log.Info("  %s: %d calls, %d tokens (prompt: %d, completion: %d)",
+				callType, stats.count, stats.total, stats.prompt, stats.completion)
+		}
+		
+		if callCount > 1 {
+			avgTokens := float64(totalTokens) / float64(callCount)
+			log.Info("Average tokens per call: %.1f", avgTokens)
+		}
+	} else {
+		log.Info("No LLM calls were made")
+	}
+	
+	return &tui.Stats{
+		TotalTokens:      totalTokens,
+		PromptTokens:     totalPrompt,
+		CompletionTokens: totalCompletion,
+		LLMCalls:         callCount,
+	}
+}
+
+func executeSingleTask(taskManager *task.Manager, executor *task.Executor, exceptionHandler *exception.Handler, log *logger.Logger, tuiModel *tui.Model) error {
 	spec := taskManager.GetSpec()
+
+	// Build execution context
+	execCtx := &task.ExecutionContext{
+		CycleNumber: 0,
+		Objective:   spec.Objective,
+	}
 
 	for _, rule := range spec.SubtaskRules {
 		subtaskID, err := taskManager.CreateSubtask(rule.Name, 0)
@@ -246,22 +383,96 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 			return fmt.Errorf("failed to update subtask status: %w", err)
 		}
 
-		result, err := executor.ExecuteSubtaskRule(rule, "Single task execution")
+		// Update context with current subtask
+		execCtx.SubtaskName = rule.Name
 
-		if err != nil {
-			log.Error("Subtask execution failed: %v", err)
+		// Execute with retry logic
+		var result *task.ExecutionResult
+		var execErr error
+		var savedStateSnapshot string
+		
+		for {
+			// Get current subtask state
+			subtask, err := taskManager.GetSubtask(subtaskID)
+			if err != nil {
+				return fmt.Errorf("failed to get subtask: %w", err)
+			}
 			
-			// Handle exception
-			needsIntervention, handleErr := exceptionHandler.HandleException(subtaskID, err)
-			if handleErr != nil {
-				return fmt.Errorf("failed to handle exception: %w", handleErr)
+			// Execute the subtask with context
+			result, execErr = executor.ExecuteSubtaskRuleWithContext(rule, "Single task execution", execCtx)
+			
+			if execErr == nil {
+				// Success - save the state snapshot for this step
+				if result.StateCapture != "" {
+					if _, err := taskManager.CreateStateSnapshot(subtaskID, 0, result.StateCapture); err != nil {
+						log.Warn("Failed to save state snapshot: %v", err)
+					}
+				}
+				break // Success, exit retry loop
+			}
+			
+			// Execution failed
+			log.Error("Subtask execution failed: %v", execErr)
+
+			// Check if this is a non-retryable failure
+			if result != nil && !result.Retryable {
+				log.Error("Non-retryable failure detected - task cannot proceed")
+				if err := taskManager.UpdateSubtaskStatus(subtaskID, state.SubtaskStatusFailed); err != nil {
+					return fmt.Errorf("failed to update subtask status: %w", err)
+				}
+				return fmt.Errorf("non-retryable failure: %w", execErr)
 			}
 
-			if needsIntervention {
-				log.Warn("Human intervention required, pausing execution")
-				return fmt.Errorf("execution paused for human intervention")
-			}
+			// Check retry limit
+			if subtask.RetryCount >= subtask.MaxRetries {
+				log.Error("Retry limit (%d) exceeded for subtask '%s'", subtask.MaxRetries, rule.Name)
+				
+				// Handle exception
+				needsIntervention, handleErr := exceptionHandler.HandleException(subtaskID, execErr)
+				if handleErr != nil {
+					return fmt.Errorf("failed to handle exception: %w", handleErr)
+				}
 
+				if needsIntervention {
+					log.Warn("Human intervention required, pausing execution")
+					return fmt.Errorf("execution paused for human intervention")
+				}
+
+				if err := taskManager.UpdateSubtaskStatus(subtaskID, state.SubtaskStatusFailed); err != nil {
+					return fmt.Errorf("failed to update subtask status: %w", err)
+				}
+				// Continue to next subtask
+				break
+			}
+			
+			// Retry: increment retry count
+			if err := taskManager.IncrementSubtaskRetry(subtaskID); err != nil {
+				return fmt.Errorf("failed to increment retry count: %w", err)
+			}
+			
+			// Restore state to before this subtask started
+			if savedStateSnapshot == "" {
+				// Get the state from before this subtask
+				snapshot, err := taskManager.GetLatestStateSnapshot(subtaskID)
+				if err != nil {
+					log.Warn("Failed to get state snapshot: %v", err)
+				} else if snapshot != nil {
+					savedStateSnapshot = snapshot.SnapshotData
+				}
+			}
+			
+			if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+				log.Info("Restoring state for retry (attempt %d/%d)", subtask.RetryCount+1, subtask.MaxRetries)
+				if err := executor.RestoreState(savedStateSnapshot); err != nil {
+					log.Warn("Failed to restore state: %v", err)
+				}
+			}
+			
+			log.Info("Retrying subtask '%s' (attempt %d/%d)", rule.Name, subtask.RetryCount+1, subtask.MaxRetries)
+		}
+		
+		if execErr != nil {
+			// Final failure after retries - skip to next subtask
 			if err := taskManager.UpdateSubtaskStatus(subtaskID, state.SubtaskStatusFailed); err != nil {
 				return fmt.Errorf("failed to update subtask status: %w", err)
 			}
@@ -281,4 +492,3 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 
 	return nil
 }
-

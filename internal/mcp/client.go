@@ -276,7 +276,6 @@ func (c *Client) connectSSE() error {
 	ch := make(chan *Response, 1)
 	c.mu.Lock()
 	c.pending[initID] = ch
-	pendingCount := len(c.pending)
 	c.mu.Unlock()
 
 	// Start reading SSE events
@@ -438,7 +437,8 @@ func (c *Client) handleHTTPStream() {
 
 	// Stream closed
 	if err := scanner.Err(); err != nil && err != io.EOF {
-		fmt.Fprintf(os.Stderr, "[MCP HTTP Stream] Error: %v\n", err)
+		// Stream error occurred
+		_ = err
 	}
 }
 
@@ -514,8 +514,8 @@ func (c *Client) handleSSEStream() {
 func (c *Client) handleStderr() {
 	scanner := bufio.NewScanner(c.stderr)
 	for scanner.Scan() {
-		// Log stderr output for debugging
-		fmt.Fprintf(os.Stderr, "[MCP Server] %s\n", scanner.Text())
+		// Consume stderr output
+		_ = scanner.Text()
 	}
 }
 
@@ -870,7 +870,8 @@ func (c *Client) CallTool(name string, arguments map[string]interface{}) (json.R
 
 	resp, err := c.call("tools/call", params)
 	if err != nil {
-		return nil, err
+		// Abstract error - convert specific errors to abstract concepts
+		return nil, c.abstractError(err, name)
 	}
 
 	var toolResult struct {
@@ -899,6 +900,30 @@ func (c *Client) CallTool(name string, arguments map[string]interface{}) (json.R
 	}
 
 	return resp.Result, nil
+}
+
+// abstractError converts specific MCP errors to abstract concepts
+func (c *Client) abstractError(err error, toolName string) error {
+	errStr := err.Error()
+
+	// Abstract "Session not found" as "tool state lost"
+	if strings.Contains(errStr, "Session not found") || strings.Contains(errStr, "session") {
+		return fmt.Errorf("tool state for %s was lost - the external system's state is no longer available", toolName)
+	}
+
+	// Abstract HTTP errors
+	if strings.Contains(errStr, "404") {
+		return fmt.Errorf("tool %s could not find the requested resource - state may have been lost or resource does not exist", toolName)
+	}
+	if strings.Contains(errStr, "403") {
+		return fmt.Errorf("tool %s was denied access - insufficient permissions", toolName)
+	}
+	if strings.Contains(errStr, "timeout") {
+		return fmt.Errorf("tool %s timed out - the operation took too long", toolName)
+	}
+
+	// Return original error if no abstraction matches
+	return err
 }
 
 // Disconnect closes connection to MCP server

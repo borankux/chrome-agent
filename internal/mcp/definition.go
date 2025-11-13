@@ -199,13 +199,6 @@ func FormatStatusReport(report StatusReport) string {
 		output += fmt.Sprintf("Error: %s\n", report.ErrorMessage)
 	}
 
-	if len(report.Tools) > 0 {
-		output += "\nAvailable Tools:\n"
-		for i, tool := range report.Tools {
-			output += fmt.Sprintf("  %d. %s - %s\n", i+1, tool.Name, tool.Description)
-		}
-	}
-
 	output += "================================\n"
 	return output
 }
