@@ -1,8 +1,7 @@
 {
-    "mcpServers" : {
-        "playwright" : {
-            "url" : "http://localhost:3000",
-            "token" : "playwright"
-        }
+    "mcpServers": {
+      "playwright": {
+        "url": "http://localhost:8931/mcp"
+      }
     }
 }

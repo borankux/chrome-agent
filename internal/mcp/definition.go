@@ -71,13 +71,71 @@ type StatusReport struct {
 	ErrorMessage string
 }
 
+// MCPClientConfig represents the MCP client configuration format
+type MCPClientConfig struct {
+	MCPServers map[string]struct {
+		URL     string            `json:"url,omitempty"`
+		Command []string          `json:"command,omitempty"`
+		Env     map[string]string `json:"env,omitempty"`
+	} `json:"mcpServers,omitempty"`
+}
+
 // LoadDefinition loads and parses MCP JSON definition from file
+// Supports both server definition format and client configuration format
 func LoadDefinition(path string) (*MCPDefinition, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read MCP definition file: %w", err)
 	}
 
+	// Try parsing as client config format first
+	var clientConfig MCPClientConfig
+	if err := json.Unmarshal(data, &clientConfig); err == nil && len(clientConfig.MCPServers) > 0 {
+		// Extract first server configuration
+		var serverName string
+		var serverConfig struct {
+			URL     string            `json:"url,omitempty"`
+			Command []string          `json:"command,omitempty"`
+			Env     map[string]string `json:"env,omitempty"`
+		}
+		
+		for name, config := range clientConfig.MCPServers {
+			serverName = name
+			serverConfig = config
+			break
+		}
+
+		// Convert to server definition format
+		def := &MCPDefinition{
+			Name:        serverName,
+			Version:     "1.0.0",
+			Description: fmt.Sprintf("MCP server: %s", serverName),
+		}
+
+		if serverConfig.URL != "" {
+			// HTTP transport
+			def.Transport = TransportConfig{
+				Type: "http",
+				HTTP: &HTTPTransportConfig{
+					URL: serverConfig.URL,
+				},
+			}
+		} else if len(serverConfig.Command) > 0 {
+			// Stdio transport
+			def.Transport = TransportConfig{
+				Type:    "stdio",
+				Command: serverConfig.Command,
+				Env:     serverConfig.Env,
+			}
+		} else {
+			return nil, fmt.Errorf("no transport configuration found in client config")
+		}
+
+		// Tools will be fetched from server during connection
+		return def, nil
+	}
+
+	// Try parsing as server definition format
 	var def MCPDefinition
 	if err := json.Unmarshal(data, &def); err != nil {
 		return nil, fmt.Errorf("failed to parse MCP definition JSON: %w", err)
@@ -91,6 +149,9 @@ func LoadDefinition(path string) (*MCPDefinition, error) {
 }
 
 func validateDefinition(def *MCPDefinition) error {
+	if def == nil {
+		return fmt.Errorf("definition is nil")
+	}
 	if def.Name == "" {
 		return fmt.Errorf("name is required")
 	}

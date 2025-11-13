@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"chrome-agent/internal/exception"
 	"chrome-agent/internal/llm"
@@ -54,9 +55,38 @@ func main() {
 
 	// Validate MCP connection and output status report
 	log.Info("Validating MCP server connection...")
-	statusReport, err := mcpClient.ValidateConnection()
-	if err != nil {
-		log.Error("MCP server validation failed: %v", err)
+	if mcpDef.Transport.HTTP != nil {
+		log.Info("MCP server URL: %s", mcpDef.Transport.HTTP.URL)
+		log.Debug("Connecting to HTTP MCP server...")
+	} else {
+		log.Debug("MCP transport type: %s", mcpDef.Transport.Type)
+	}
+	
+	// Add timeout context for validation
+	validationDone := make(chan bool, 1)
+	var statusReport *mcp.StatusReport
+	var validationErr error
+	
+	go func() {
+		statusReport, validationErr = mcpClient.ValidateConnection()
+		validationDone <- true
+	}()
+	
+	select {
+	case <-validationDone:
+		if validationErr != nil {
+			log.Error("MCP server validation failed: %v", validationErr)
+			if statusReport != nil && statusReport.ErrorMessage != "" {
+				log.Error("Error details: %s", statusReport.ErrorMessage)
+			}
+			os.Exit(1)
+		}
+	case <-time.After(15 * time.Second):
+		log.Error("MCP server validation timed out after 15 seconds")
+		log.Error("Please check:")
+		log.Error("  1. Is the MCP server running at %s?", mcpDef.Transport.HTTP.URL)
+		log.Error("  2. Is the server accessible?")
+		log.Error("  3. Check server logs for errors")
 		os.Exit(1)
 	}
 
