@@ -34,6 +34,12 @@ type Client struct {
 	mu         sync.Mutex
 	requestID  int64
 	pending    map[int64]chan *Response
+	// Health tracking
+	consecutiveFailures  int
+	lastSuccessfulCall   time.Time
+	lastFailureTime      time.Time
+	reconnectAttempts    int
+	maxReconnectAttempts int
 }
 
 // Request represents an MCP JSON-RPC request
@@ -86,8 +92,9 @@ type CallToolParams struct {
 // NewClient creates a new MCP client
 func NewClient(def *MCPDefinition) *Client {
 	return &Client{
-		def:     def,
-		pending: make(map[int64]chan *Response),
+		def:                  def,
+		pending:              make(map[int64]chan *Response),
+		maxReconnectAttempts: 5, // Maximum reconnection attempts before declaring dead
 	}
 }
 
@@ -163,6 +170,9 @@ func (c *Client) connectStdio() error {
 	}
 
 	c.connected = true
+	c.lastSuccessfulCall = time.Now()
+	c.consecutiveFailures = 0
+	c.reconnectAttempts = 0
 	return nil
 }
 
@@ -338,6 +348,9 @@ func (c *Client) connectHTTP() error {
 	}
 
 	c.connected = true
+	c.lastSuccessfulCall = time.Now()
+	c.consecutiveFailures = 0
+	c.reconnectAttempts = 0
 	return nil
 }
 
@@ -840,14 +853,41 @@ func (c *Client) ValidateConnection() (*StatusReport, error) {
 // ListTools returns available tools
 func (c *Client) ListTools() ([]ToolDefinition, error) {
 	if !c.connected {
-		return nil, fmt.Errorf("not connected to MCP server")
+		// Try to reconnect
+		if err := c.Reconnect(); err != nil {
+			c.recordFailure()
+			// Fallback to definition tools if reconnection fails
+			return c.def.Tools, nil
+		}
 	}
 
 	resp, err := c.call("tools/list", nil)
 	if err != nil {
-		// Fallback to definition tools
-		return c.def.Tools, nil
+		// Check if this is a connection error
+		if c.isConnectionError(err) {
+			c.recordFailure()
+			// Try to reconnect
+			if reconnectErr := c.Reconnect(); reconnectErr != nil {
+				c.recordFailure()
+				// Fallback to definition tools if reconnection fails
+				return c.def.Tools, nil
+			}
+			// Retry the call after reconnection
+			resp, err = c.call("tools/list", nil)
+			if err != nil {
+				c.recordFailure()
+				// Fallback to definition tools
+				return c.def.Tools, nil
+			}
+		} else {
+			c.recordFailure()
+			// Fallback to definition tools
+			return c.def.Tools, nil
+		}
 	}
+
+	// Success - record it
+	c.recordSuccess()
 
 	var result ToolsListResult
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
@@ -974,4 +1014,165 @@ func (c *Client) Disconnect() error {
 // GetDefinition returns the loaded MCP definition
 func (c *Client) GetDefinition() *MCPDefinition {
 	return c.def
+}
+
+// Reconnect attempts to reconnect to the MCP server
+func (c *Client) Reconnect() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// If already connected, check health first
+	if c.connected {
+		// Quick health check
+		if time.Since(c.lastSuccessfulCall) < 30*time.Second {
+			return nil // Recently successful, assume healthy
+		}
+	}
+
+	// Disconnect existing connection
+	if c.connected {
+		c.connected = false
+		if c.stdin != nil {
+			c.stdin.Close()
+		}
+		if c.cmd != nil {
+			c.cmd.Process.Kill()
+			c.cmd.Wait()
+		}
+		if c.httpStream != nil {
+			c.httpStream.Close()
+			c.httpStream = nil
+		}
+		if c.sseStream != nil {
+			c.sseStream.Close()
+			c.sseStream = nil
+		}
+		if c.sseCancel != nil {
+			c.sseCancel()
+			c.sseCancel = nil
+		}
+	}
+
+	// Attempt reconnection with exponential backoff
+	maxAttempts := 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * time.Second
+			time.Sleep(backoff)
+		}
+
+		err := c.Connect()
+		if err == nil {
+			c.reconnectAttempts = 0
+			c.connected = true
+			return nil
+		}
+
+		c.reconnectAttempts++
+	}
+
+	return fmt.Errorf("failed to reconnect after %d attempts", maxAttempts)
+}
+
+// recordSuccess records a successful MCP call
+func (c *Client) recordSuccess() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.consecutiveFailures = 0
+	c.lastSuccessfulCall = time.Now()
+	c.reconnectAttempts = 0
+}
+
+// recordFailure records a failed MCP call
+func (c *Client) recordFailure() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.consecutiveFailures++
+	c.lastFailureTime = time.Now()
+}
+
+// isConnectionError checks if an error indicates connection loss
+func (c *Client) isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	connectionErrors := []string{
+		"not connected",
+		"connection",
+		"timeout",
+		"refused",
+		"network",
+		"eof",
+		"broken pipe",
+		"no such host",
+		"dial",
+		"http request failed",
+		"sse connection failed",
+	}
+	for _, pattern := range connectionErrors {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetHealth returns MCP connection health metrics
+func (c *Client) GetHealth() MCPHealth {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	timeSinceLastSuccess := time.Since(c.lastSuccessfulCall)
+	timeSinceLastFailure := time.Since(c.lastFailureTime)
+
+	health := MCPHealth{
+		Connected:            c.connected,
+		ConsecutiveFailures:  c.consecutiveFailures,
+		ReconnectAttempts:    c.reconnectAttempts,
+		TimeSinceLastSuccess: timeSinceLastSuccess,
+		TimeSinceLastFailure: timeSinceLastFailure,
+	}
+
+	// Determine health status
+	if !c.connected {
+		health.Status = "disconnected"
+	} else if c.consecutiveFailures >= 5 {
+		health.Status = "dead"
+	} else if c.consecutiveFailures >= 3 {
+		health.Status = "unresponsive"
+	} else if c.consecutiveFailures >= 1 {
+		health.Status = "degraded"
+	} else {
+		health.Status = "healthy"
+	}
+
+	return health
+}
+
+// MCPHealth represents MCP connection health metrics
+type MCPHealth struct {
+	Status               string
+	Connected            bool
+	ConsecutiveFailures  int
+	ReconnectAttempts    int
+	TimeSinceLastSuccess time.Duration
+	TimeSinceLastFailure time.Duration
+}
+
+// CheckMCPHealth performs a health check by attempting to list tools
+func (c *Client) CheckMCPHealth() error {
+	if !c.connected {
+		return fmt.Errorf("MCP server not connected")
+	}
+
+	// Try to list tools as a health check
+	_, err := c.call("tools/list", nil)
+	if err != nil {
+		c.recordFailure()
+		return fmt.Errorf("MCP health check failed: %w", err)
+	}
+
+	c.recordSuccess()
+	return nil
 }

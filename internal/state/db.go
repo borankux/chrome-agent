@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"chrome-agent/internal/session"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -181,10 +183,26 @@ func (d *DB) initSchema() error {
 		FOREIGN KEY (subtask_id) REFERENCES subtasks(id)
 	);
 
+	CREATE TABLE IF NOT EXISTS sessions (
+		id TEXT PRIMARY KEY,
+		tool_type TEXT NOT NULL,
+		state TEXT NOT NULL DEFAULT 'active',
+		last_successful_op DATETIME,
+		last_failure_time DATETIME,
+		consecutive_failures INTEGER NOT NULL DEFAULT 0,
+		total_operations INTEGER NOT NULL DEFAULT 0,
+		successful_operations INTEGER NOT NULL DEFAULT 0,
+		metadata TEXT,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_subtasks_task_id ON subtasks(task_id);
 	CREATE INDEX IF NOT EXISTS idx_loops_task_id ON loops(task_id);
 	CREATE INDEX IF NOT EXISTS idx_exceptions_subtask_id ON exceptions(subtask_id);
 	CREATE INDEX IF NOT EXISTS idx_state_snapshots_subtask_id ON state_snapshots(subtask_id);
+	CREATE INDEX IF NOT EXISTS idx_sessions_tool_type ON sessions(tool_type);
+	CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
 	`
 
 	_, err := d.db.Exec(schema)
@@ -464,5 +482,195 @@ func (d *DB) GetLatestStateSnapshot(subtaskID int64) (*StateSnapshot, error) {
 		return nil, err
 	}
 	return &snapshot, nil
+}
+
+// CreateSession creates a new session in the database
+func (d *DB) CreateSession(sess *session.Session) error {
+	metadataJSON, err := json.Marshal(sess.Metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	_, err = d.db.Exec(
+		`INSERT INTO sessions (
+			id, tool_type, state, last_successful_op, last_failure_time,
+			consecutive_failures, total_operations, successful_operations,
+			metadata, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sess.ID, sess.ToolType, string(sess.State),
+		sess.LastSuccessfulOp, sess.LastFailureTime,
+		sess.ConsecutiveFailures, sess.TotalOperations, sess.SuccessfulOperations,
+		string(metadataJSON), sess.CreatedAt, sess.UpdatedAt,
+	)
+	return err
+}
+
+// GetSession retrieves a session by ID
+func (d *DB) GetSession(sessionID string) (*session.Session, error) {
+	row := d.db.QueryRow(
+		`SELECT id, tool_type, state, last_successful_op, last_failure_time,
+			consecutive_failures, total_operations, successful_operations,
+			metadata, created_at, updated_at
+		FROM sessions WHERE id = ?`,
+		sessionID,
+	)
+
+	var sess session.Session
+	var metadataJSON string
+	var lastSuccessOp, lastFailureTime sql.NullTime
+
+	err := row.Scan(
+		&sess.ID, &sess.ToolType, &sess.State,
+		&lastSuccessOp, &lastFailureTime,
+		&sess.ConsecutiveFailures, &sess.TotalOperations, &sess.SuccessfulOperations,
+		&metadataJSON, &sess.CreatedAt, &sess.UpdatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("session %s not found", sessionID)
+		}
+		return nil, err
+	}
+
+	if lastSuccessOp.Valid {
+		sess.LastSuccessfulOp = lastSuccessOp.Time
+	}
+	if lastFailureTime.Valid {
+		sess.LastFailureTime = lastFailureTime.Time
+	}
+
+	if metadataJSON != "" {
+		if err := json.Unmarshal([]byte(metadataJSON), &sess.Metadata); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+		}
+	}
+
+	return &sess, nil
+}
+
+// UpdateSession updates a session in the database
+func (d *DB) UpdateSession(sess *session.Session) error {
+	metadataJSON, err := json.Marshal(sess.Metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	_, err = d.db.Exec(
+		`UPDATE sessions SET
+			state = ?, last_successful_op = ?, last_failure_time = ?,
+			consecutive_failures = ?, total_operations = ?, successful_operations = ?,
+			metadata = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`,
+		string(sess.State), sess.LastSuccessfulOp, sess.LastFailureTime,
+		sess.ConsecutiveFailures, sess.TotalOperations, sess.SuccessfulOperations,
+		string(metadataJSON), sess.ID,
+	)
+	return err
+}
+
+// GetActiveSessions returns all active sessions
+func (d *DB) GetActiveSessions() ([]*session.Session, error) {
+	rows, err := d.db.Query(
+		`SELECT id, tool_type, state, last_successful_op, last_failure_time,
+			consecutive_failures, total_operations, successful_operations,
+			metadata, created_at, updated_at
+		FROM sessions WHERE state IN ('active', 'recovering')`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*session.Session
+	for rows.Next() {
+		var sess session.Session
+		var metadataJSON string
+		var lastSuccessOp, lastFailureTime sql.NullTime
+
+		err := rows.Scan(
+			&sess.ID, &sess.ToolType, &sess.State,
+			&lastSuccessOp, &lastFailureTime,
+			&sess.ConsecutiveFailures, &sess.TotalOperations, &sess.SuccessfulOperations,
+			&metadataJSON, &sess.CreatedAt, &sess.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if lastSuccessOp.Valid {
+			sess.LastSuccessfulOp = lastSuccessOp.Time
+		}
+		if lastFailureTime.Valid {
+			sess.LastFailureTime = lastFailureTime.Time
+		}
+
+		if metadataJSON != "" {
+			if err := json.Unmarshal([]byte(metadataJSON), &sess.Metadata); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+			}
+		}
+
+		sessions = append(sessions, &sess)
+	}
+
+	return sessions, rows.Err()
+}
+
+// GetSessionsByToolType returns all sessions for a specific tool type
+func (d *DB) GetSessionsByToolType(toolType string) ([]*session.Session, error) {
+	rows, err := d.db.Query(
+		`SELECT id, tool_type, state, last_successful_op, last_failure_time,
+			consecutive_failures, total_operations, successful_operations,
+			metadata, created_at, updated_at
+		FROM sessions WHERE tool_type = ?`,
+		toolType,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*session.Session
+	for rows.Next() {
+		var sess session.Session
+		var metadataJSON string
+		var lastSuccessOp, lastFailureTime sql.NullTime
+
+		err := rows.Scan(
+			&sess.ID, &sess.ToolType, &sess.State,
+			&lastSuccessOp, &lastFailureTime,
+			&sess.ConsecutiveFailures, &sess.TotalOperations, &sess.SuccessfulOperations,
+			&metadataJSON, &sess.CreatedAt, &sess.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		if lastSuccessOp.Valid {
+			sess.LastSuccessfulOp = lastSuccessOp.Time
+		}
+		if lastFailureTime.Valid {
+			sess.LastFailureTime = lastFailureTime.Time
+		}
+
+		if metadataJSON != "" {
+			if err := json.Unmarshal([]byte(metadataJSON), &sess.Metadata); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+			}
+		}
+
+		sessions = append(sessions, &sess)
+	}
+
+	return sessions, rows.Err()
+}
+
+// CloseSession marks a session as closed
+func (d *DB) CloseSession(sessionID string) error {
+	_, err := d.db.Exec(
+		"UPDATE sessions SET state = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		sessionID,
+	)
+	return err
 }
 

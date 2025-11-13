@@ -170,7 +170,12 @@ func main() {
 	}
 
 	// Create task executor
-	executor := task.NewExecutor(mcpClient, llmCoord, log)
+	executor := task.NewExecutor(mcpClient, llmCoord, log, db)
+	
+	// Load active sessions from database
+	if err := executor.LoadSessions(); err != nil {
+		log.Warn("Failed to load sessions: %v", err)
+	}
 
 	// Create exception handler
 	exceptionHandler := exception.NewHandler(taskManager, db, log, taskSpec)
@@ -252,6 +257,11 @@ func main() {
 			finalState.Status = "failed"
 		}
 		tuiModel.SendUpdate(tui.TaskUpdateMsg{State: finalState})
+	}
+
+	// Save sessions before exit
+	if err := executor.SaveSessions(); err != nil {
+		log.Warn("Failed to save sessions: %v", err)
 	}
 
 	// Handle execution result
@@ -463,20 +473,58 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 								return fmt.Errorf("LLM decided to end task due to deadlock: %w", execErr)
 							case "recover_state":
 								log.Info("Attempting state recovery...")
-								if savedStateSnapshot == "" {
-									snapshot, err := taskManager.GetLatestStateSnapshot(subtaskID)
-									if err == nil && snapshot != nil {
-										savedStateSnapshot = snapshot.SnapshotData
+								
+								// Check if this is a browser session loss error
+								isSessionLoss := strings.Contains(execErr.Error(), "tool state") && 
+									strings.Contains(execErr.Error(), "lost")
+								
+								if isSessionLoss {
+									// For browser session loss, try to re-establish the session first
+									log.Info("Detected browser session loss, attempting to re-establish session...")
+									
+									// Get state snapshot for URL
+									if savedStateSnapshot == "" {
+										snapshot, err := taskManager.GetLatestStateSnapshot(subtaskID)
+										if err == nil && snapshot != nil {
+											savedStateSnapshot = snapshot.SnapshotData
+										}
 									}
-								}
-								if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
-									if err := executor.RestoreState(savedStateSnapshot); err != nil {
-										log.Warn("State recovery failed: %v", err)
+									
+									// Try to re-establish browser session
+									if err := executor.ReestablishBrowserSession(savedStateSnapshot); err != nil {
+										log.Warn("Failed to re-establish browser session: %v", err)
+										log.Warn("Browser session recovery failed, skipping subtask")
+										break
 									}
+									
+									// Session re-established, now restore full state
+									if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+										if err := executor.RestoreState(savedStateSnapshot); err != nil {
+											log.Warn("State restoration after session recovery failed: %v", err)
+										}
+									}
+									
+									log.Info("Browser session and state recovered successfully, retrying subtask")
+									// Reset retry count and retry
+									subtask.RetryCount = 0
+									continue
+								} else {
+									// For other types of state loss, use standard restoration
+									if savedStateSnapshot == "" {
+										snapshot, err := taskManager.GetLatestStateSnapshot(subtaskID)
+										if err == nil && snapshot != nil {
+											savedStateSnapshot = snapshot.SnapshotData
+										}
+									}
+									if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+										if err := executor.RestoreState(savedStateSnapshot); err != nil {
+											log.Warn("State recovery failed: %v", err)
+										}
+									}
+									// Reset and try once more
+									subtask.RetryCount = 0
+									continue
 								}
-								// Reset and try once more
-								subtask.RetryCount = 0
-								continue
 							case "skip", "adjust_approach":
 								log.Info("Skipping subtask per LLM decision")
 								break
@@ -529,6 +577,10 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 							}
 							// Reset retry count and try once more
 							subtask.RetryCount = 0
+							continue
+						case "keep_session":
+							log.Info("LLM decided to keep session alive and retry")
+							// Session is preserved, retry the subtask
 							continue
 						case "skip", "adjust_approach":
 							log.Info("Skipping subtask per LLM decision")

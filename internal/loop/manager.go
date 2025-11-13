@@ -257,22 +257,56 @@ func (m *Manager) ExecuteLoop() error {
 							break // Exit retry loop, continue to next subtask
 						case "recover_state":
 							m.logger.Info("LLM decided to recover state to resolve deadlock")
-							// Attempt state recovery
-							if savedStateSnapshot == "" {
-								snapshot, err := m.taskManager.GetLatestStateSnapshot(subtaskID)
-								if err == nil && snapshot != nil {
-									savedStateSnapshot = snapshot.SnapshotData
+							
+							// Check if this is a browser session loss error
+							isSessionLoss := strings.Contains(execErr.Error(), "tool state") && 
+								strings.Contains(execErr.Error(), "lost")
+							
+							if isSessionLoss {
+								// For browser session loss, try to re-establish the session first
+								m.logger.Info("Detected browser session loss, attempting to re-establish session...")
+								
+								// Get state snapshot for URL
+								if savedStateSnapshot == "" {
+									snapshot, err := m.taskManager.GetLatestStateSnapshot(subtaskID)
+									if err == nil && snapshot != nil {
+										savedStateSnapshot = snapshot.SnapshotData
+									}
 								}
-							}
-							if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
-								if err := m.executor.RestoreState(savedStateSnapshot); err != nil {
-									m.logger.Warn("State recovery failed: %v", err)
+								
+								// Try to re-establish browser session
+								if err := m.executor.ReestablishBrowserSession(savedStateSnapshot); err != nil {
+									m.logger.Warn("Failed to re-establish browser session: %v", err)
+									m.logger.Warn("Browser session recovery failed, skipping subtask")
+									break
 								}
+								
+								// Session re-established, now restore full state
+								if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+									if err := m.executor.RestoreState(savedStateSnapshot); err != nil {
+										m.logger.Warn("State restoration after session recovery failed: %v", err)
+									}
+								}
+								
+								m.logger.Info("Browser session and state recovered successfully, retrying subtask")
+								// Clear error patterns and retry
+								continue
+							} else {
+								// For other types of state loss, use standard restoration
+								if savedStateSnapshot == "" {
+									snapshot, err := m.taskManager.GetLatestStateSnapshot(subtaskID)
+									if err == nil && snapshot != nil {
+										savedStateSnapshot = snapshot.SnapshotData
+									}
+								}
+								if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+									if err := m.executor.RestoreState(savedStateSnapshot); err != nil {
+										m.logger.Warn("State recovery failed: %v", err)
+									}
+								}
+								// Retry after state recovery
+								continue
 							}
-							// Reset retry count and try once more
-							subtask.RetryCount = 0
-							// Clear error patterns to allow retry
-							continue
 						case "adjust_approach":
 							m.logger.Info("LLM decided to adjust approach due to deadlock - skipping subtask")
 							break // Skip this subtask
@@ -319,7 +353,7 @@ func (m *Manager) ExecuteLoop() error {
 							
 							// Send prompt to TUI if available
 							if m.tuiModel != nil {
-								options := []string{"skip", "end_cycle", "end_task", "recover_state", "adjust_approach"}
+								options := []string{"skip", "end_cycle", "end_task", "recover_state", "adjust_approach", "keep_session"}
 								m.tuiModel.SendPrompt("retry_exhaustion", reasoning, options, func(selected string) {
 									action = selected
 								})
@@ -335,31 +369,67 @@ func (m *Manager) ExecuteLoop() error {
 							break // Exit retry loop, continue to next subtask
 						case "recover_state":
 							m.logger.Info("LLM decided to recover state")
-							// Attempt state recovery
-							if savedStateSnapshot == "" {
-								snapshot, err := m.taskManager.GetLatestStateSnapshot(subtaskID)
-								if err == nil && snapshot != nil {
-									savedStateSnapshot = snapshot.SnapshotData
+							
+							// Check if this is a browser session loss error
+							isSessionLoss := strings.Contains(execErr.Error(), "tool state") && 
+								strings.Contains(execErr.Error(), "lost")
+							
+							if isSessionLoss {
+								// For browser session loss, try to re-establish the session first
+								m.logger.Info("Detected browser session loss, attempting to re-establish session...")
+								
+								// Get state snapshot for URL
+								if savedStateSnapshot == "" {
+									snapshot, err := m.taskManager.GetLatestStateSnapshot(subtaskID)
+									if err == nil && snapshot != nil {
+										savedStateSnapshot = snapshot.SnapshotData
+									}
 								}
-							}
-							if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
-								if err := m.executor.RestoreState(savedStateSnapshot); err != nil {
-									m.logger.Warn("State recovery failed: %v", err)
-								} else {
-									m.logger.Info("State recovered successfully, retrying subtask")
-									// Reset retry count in database to allow one more retry
-									// Create a new subtask attempt or reset retry count
-									// For now, we'll break and let the next cycle handle it
-									// In a production system, you'd want to reset the retry count properly
+								
+								// Try to re-establish browser session
+								if err := m.executor.ReestablishBrowserSession(savedStateSnapshot); err != nil {
+									m.logger.Warn("Failed to re-establish browser session: %v", err)
+									m.logger.Warn("Browser session recovery failed, skipping subtask")
 									break
 								}
+								
+								// Session re-established, now restore full state
+								if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+									if err := m.executor.RestoreState(savedStateSnapshot); err != nil {
+										m.logger.Warn("State restoration after session recovery failed: %v", err)
+									}
+								}
+								
+								m.logger.Info("Browser session and state recovered successfully, retrying subtask")
+								// Clear error patterns and retry
+								continue
+							} else {
+								// For other types of state loss, use standard restoration
+								if savedStateSnapshot == "" {
+									snapshot, err := m.taskManager.GetLatestStateSnapshot(subtaskID)
+									if err == nil && snapshot != nil {
+										savedStateSnapshot = snapshot.SnapshotData
+									}
+								}
+								if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+									if err := m.executor.RestoreState(savedStateSnapshot); err != nil {
+										m.logger.Warn("State recovery failed: %v", err)
+									} else {
+										m.logger.Info("State recovered successfully, retrying subtask")
+										continue
+									}
+								}
+								// If recovery failed, fall through to skip
+								m.logger.Warn("State recovery unavailable or failed, skipping subtask")
+								break
 							}
-							// If recovery failed, fall through to skip
-							m.logger.Warn("State recovery unavailable or failed, skipping subtask")
-							break
 						case "adjust_approach":
 							m.logger.Info("LLM decided to adjust approach - skipping subtask")
 							break // Skip this subtask
+						case "keep_session":
+							m.logger.Info("LLM decided to keep session alive and retry")
+							// Session is preserved, retry the subtask
+							continue
 						case "skip":
 							fallthrough
 						default:
@@ -449,6 +519,12 @@ func (m *Manager) ExecuteLoop() error {
 	}
 
 	m.logger.Info("Loop execution completed after %d cycles", cycleNumber)
+	
+	// Save sessions after loop completion
+	if err := m.executor.SaveSessions(); err != nil {
+		m.logger.Warn("Failed to save sessions after loop: %v", err)
+	}
+	
 	return nil
 }
 

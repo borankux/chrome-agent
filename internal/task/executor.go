@@ -8,6 +8,8 @@ import (
 
 	"chrome-agent/internal/llm"
 	"chrome-agent/internal/mcp"
+	"chrome-agent/internal/session"
+	"chrome-agent/internal/state"
 	"chrome-agent/pkg/logger"
 )
 
@@ -18,6 +20,9 @@ type Executor struct {
 	logger         *logger.Logger
 	executionHistory []ToolCallResult // Track tool execution history
 	errorPatterns   map[string]int     // Track consecutive errors for deadlock detection
+	sessionManager *session.Manager   // Session management
+	db             *state.DB          // Database for session persistence
+	currentSessions map[string]*session.Session // toolType -> Session
 }
 
 // ExecutionResult contains execution result
@@ -53,14 +58,129 @@ type ToolCallResult struct {
 }
 
 // NewExecutor creates a new task executor
-func NewExecutor(mcpClient *mcp.Client, llmCoord *llm.Coordinator, log *logger.Logger) *Executor {
+func NewExecutor(mcpClient *mcp.Client, llmCoord *llm.Coordinator, log *logger.Logger, db *state.DB) *Executor {
 	return &Executor{
 		mcpClient:      mcpClient,
 		llmCoord:       llmCoord,
 		logger:         log,
 		executionHistory: make([]ToolCallResult, 0),
 		errorPatterns:   make(map[string]int),
+		sessionManager: session.NewManager(),
+		db:             db,
+		currentSessions: make(map[string]*session.Session),
 	}
+}
+
+// LoadSessions loads active sessions from database
+func (e *Executor) LoadSessions() error {
+	if e.db == nil {
+		return nil
+	}
+
+	activeSessions, err := e.db.GetActiveSessions()
+	if err != nil {
+		return fmt.Errorf("failed to load active sessions: %w", err)
+	}
+
+	for _, sess := range activeSessions {
+		e.currentSessions[sess.ToolType] = sess
+		e.sessionManager.Sessions[sess.ID] = sess
+		e.logger.Info("Loaded active session: %s (tool: %s, state: %s)", sess.ID, sess.ToolType, sess.State)
+	}
+
+	return nil
+}
+
+// SaveSessions saves all sessions to database
+func (e *Executor) SaveSessions() error {
+	if e.db == nil {
+		return nil
+	}
+
+	for _, sess := range e.currentSessions {
+		// Check if session exists in DB
+		_, err := e.db.GetSession(sess.ID)
+		if err != nil {
+			// Session doesn't exist, create it
+			if err := e.db.CreateSession(sess); err != nil {
+				e.logger.Warn("Failed to create session %s: %v", sess.ID, err)
+			}
+		} else {
+			// Session exists, update it
+			if err := e.db.UpdateSession(sess); err != nil {
+				e.logger.Warn("Failed to update session %s: %v", sess.ID, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// getToolType determines tool type from tool name (tool-agnostic)
+func (e *Executor) getToolType(toolName string) string {
+	// Extract tool type from tool name (e.g., "browser_navigate" -> "browser")
+	// This is tool-agnostic - works with any naming convention
+	toolNameLower := strings.ToLower(toolName)
+	
+	// Common patterns
+	if strings.Contains(toolNameLower, "browser") {
+		return "browser"
+	}
+	if strings.Contains(toolNameLower, "api") || strings.Contains(toolNameLower, "http") {
+		return "api"
+	}
+	if strings.Contains(toolNameLower, "database") || strings.Contains(toolNameLower, "db") {
+		return "database"
+	}
+	if strings.Contains(toolNameLower, "file") || strings.Contains(toolNameLower, "fs") {
+		return "filesystem"
+	}
+	
+	// Default: use first part of tool name or "unknown"
+	parts := strings.Split(toolNameLower, "_")
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return "unknown"
+}
+
+// getOrCreateSession gets or creates a session for a tool type
+// Sessions are reused across multiple tool calls of the same type
+func (e *Executor) getOrCreateSession(toolType string, metadata map[string]interface{}) *session.Session {
+	// Check if we have an active session for this tool type
+	if sess, exists := e.currentSessions[toolType]; exists {
+		if sess.State == session.StateActive || sess.State == session.StateRecovering {
+			// Update metadata even when reusing session (e.g., track latest operation)
+			if metadata != nil && len(metadata) > 0 {
+				if err := e.sessionManager.UpdateMetadata(sess.ID, metadata); err != nil {
+					e.logger.Debug("Failed to update session metadata: %v", err)
+				}
+				// Also update in-memory session
+				if sess.Metadata == nil {
+					sess.Metadata = make(map[string]interface{})
+				}
+				for k, v := range metadata {
+					sess.Metadata[k] = v
+				}
+			}
+			e.logger.Debug("Reusing existing session %s for tool type %s", sess.ID, toolType)
+			return sess
+		}
+	}
+
+	// Create new session
+	sess := e.sessionManager.CreateSession(toolType, metadata)
+	e.currentSessions[toolType] = sess
+	e.logger.Debug("Created new session %s for tool type %s", sess.ID, toolType)
+	
+	// Save to database
+	if e.db != nil {
+		if err := e.db.CreateSession(sess); err != nil {
+			e.logger.Warn("Failed to save session to database: %v", err)
+		}
+	}
+
+	return sess
 }
 
 // GetLLMCoordinator returns the LLM coordinator
@@ -72,8 +192,46 @@ func (e *Executor) GetLLMCoordinator() *llm.Coordinator {
 func (e *Executor) ValidateToolAccessible(toolName string) error {
 	e.logger.Debug("Checking MCP tool availability: %s", toolName)
 	
+	// Check MCP health before listing tools
+	health := e.mcpClient.GetHealth()
+	if health.Status == "dead" {
+		return fmt.Errorf("MCP server is dead - cannot access tools")
+	}
+	
+	// If health is poor, ask LLM what to do
+	if health.Status == "unresponsive" && e.llmCoord != nil {
+		contextStr := fmt.Sprintf("Attempting to validate tool %s", toolName)
+		action, reasoning, err := e.llmCoord.EvaluateMCPHealth(
+			health.Status,
+			health.ConsecutiveFailures,
+			health.ReconnectAttempts,
+			health.TimeSinceLastSuccess,
+			contextStr,
+			"", // Objective not available here
+			"tool validation",
+		)
+		if err == nil {
+			e.logger.Info("LLM MCP health decision: %s", action)
+			e.logger.Debug("LLM reasoning: %s", reasoning)
+			
+			if action == "stop_task" {
+				return fmt.Errorf("LLM determined MCP server is dead - cannot proceed: %s", reasoning)
+			}
+			if action == "retry_connection" {
+				if err := e.mcpClient.Reconnect(); err != nil {
+					return fmt.Errorf("MCP reconnection failed: %w", err)
+				}
+			}
+		}
+	}
+	
 	tools, err := e.mcpClient.ListTools()
 	if err != nil {
+		// Check if this is a connection error
+		health := e.mcpClient.GetHealth()
+		if health.Status == "dead" || health.ConsecutiveFailures >= 5 {
+			return fmt.Errorf("MCP server appears dead after %d failures - cannot access tools", health.ConsecutiveFailures)
+		}
 		return fmt.Errorf("failed to list tools: %w", err)
 	}
 
@@ -159,54 +317,247 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 	}
 	result.StateCapture = stateCapture
 
+	// Get or create session for this tool
+	toolType := e.getToolType(toolName)
+	sess := e.getOrCreateSession(toolType, map[string]interface{}{
+		"tool_name": toolName,
+		"last_operation": "execute",
+	})
+
+	// Check session health before execution
+	health := sess.GetHealth()
+	if !health.IsHealthy && sess.State == session.StateActive {
+		e.logger.Warn("Session %s health degraded: success_rate=%.2f, consecutive_failures=%d", 
+			sess.ID, health.SuccessRate, health.ConsecutiveFailures)
+	}
+
+	// Check MCP health before execution
+	mcpHealth := e.mcpClient.GetHealth()
+	if mcpHealth.Status == "dead" {
+		// MCP is dead - ask LLM what to do
+		if e.llmCoord != nil {
+			contextStr := ""
+			if execCtx != nil {
+				contextStr = e.buildContextString(execCtx, rule)
+			}
+			objective := ""
+			if execCtx != nil {
+				objective = execCtx.Objective
+			}
+			taskProgress := fmt.Sprintf("Subtask: %s, Tool: %s", rule.Name, toolName)
+			
+			action, reasoning, err := e.llmCoord.EvaluateMCPHealth(
+				mcpHealth.Status,
+				mcpHealth.ConsecutiveFailures,
+				mcpHealth.ReconnectAttempts,
+				mcpHealth.TimeSinceLastSuccess,
+				contextStr,
+				objective,
+				taskProgress,
+			)
+			if err == nil {
+				e.logger.Info("LLM MCP health decision: %s", action)
+				e.logger.Debug("LLM reasoning: %s", reasoning)
+				
+				if action == "stop_task" {
+					return result, fmt.Errorf("LLM determined MCP server is dead - stopping task: %s", reasoning)
+				}
+				if action == "retry_connection" {
+					e.logger.Info("LLM decided to retry MCP connection")
+					if reconnectErr := e.mcpClient.Reconnect(); reconnectErr != nil {
+						return result, fmt.Errorf("MCP reconnection failed: %w", reconnectErr)
+					}
+					// Health may have improved after reconnection
+					mcpHealth = e.mcpClient.GetHealth()
+				}
+			}
+		} else {
+			// No LLM coordinator - stop task if MCP is dead
+			return result, fmt.Errorf("MCP server is dead (%d consecutive failures) - cannot proceed", mcpHealth.ConsecutiveFailures)
+		}
+	}
+
 	// Execute single tool call
 	e.logger.Tool("Executing: %s", toolName)
 	e.logger.Debug("  Arguments: %v", arguments)
+	e.logger.Debug("  Session: %s (tool: %s, state: %s)", sess.ID, toolType, sess.State)
+	e.logger.Debug("  MCP Health: %s (failures: %d)", mcpHealth.Status, mcpHealth.ConsecutiveFailures)
 
 	toolResult, err := e.mcpClient.CallTool(toolName, arguments)
 	if err != nil {
-		// Error is already abstracted by MCP client, but add more context if needed
-		abstractError := err.Error()
-		e.logger.Error("  ✗ Tool execution failed")
-		e.logger.Error("    Tool: %s", toolName)
-		e.logger.Error("    Error: %s", abstractError)
+		// Check MCP health after failure
+		mcpHealth = e.mcpClient.GetHealth()
 		
-		// Track error pattern for deadlock detection
-		errorKey := fmt.Sprintf("%s:%s", toolName, abstractError)
-		e.errorPatterns[errorKey]++
-		consecutiveFailures := e.errorPatterns[errorKey]
-		
-		// Check for deadlock (same error 3+ times)
-		isDeadlock := consecutiveFailures >= 3
-		if isDeadlock {
-			e.logger.Warn("  ⚠ Deadlock detected: Same error repeated %d times", consecutiveFailures)
+		// If MCP appears dead or unresponsive, ask LLM what to do
+		if (mcpHealth.Status == "dead" || mcpHealth.Status == "unresponsive") && e.llmCoord != nil {
+			contextStr := ""
+			if execCtx != nil {
+				contextStr = e.buildContextString(execCtx, rule)
+			}
+			objective := ""
+			if execCtx != nil {
+				objective = execCtx.Objective
+			}
+			taskProgress := fmt.Sprintf("Subtask: %s, Tool: %s", rule.Name, toolName)
+			
+			action, reasoning, err := e.llmCoord.EvaluateMCPHealth(
+				mcpHealth.Status,
+				mcpHealth.ConsecutiveFailures,
+				mcpHealth.ReconnectAttempts,
+				mcpHealth.TimeSinceLastSuccess,
+				contextStr,
+				objective,
+				taskProgress,
+			)
+			if err == nil {
+				e.logger.Info("LLM MCP health decision: %s", action)
+				e.logger.Debug("LLM reasoning: %s", reasoning)
+				
+				if action == "stop_task" {
+					return result, fmt.Errorf("LLM determined MCP server is dead - stopping task: %s", reasoning)
+				}
+				if action == "retry_connection" {
+					e.logger.Info("LLM decided to retry MCP connection")
+					if reconnectErr := e.mcpClient.Reconnect(); reconnectErr != nil {
+						e.logger.Error("MCP reconnection failed: %v", reconnectErr)
+						return result, fmt.Errorf("MCP reconnection failed: %w", reconnectErr)
+					}
+					// Retry the tool call after reconnection
+					toolResult, err = e.mcpClient.CallTool(toolName, arguments)
+					if err != nil {
+						// Still failed after reconnection
+						mcpHealth = e.mcpClient.GetHealth()
+						if mcpHealth.Status == "dead" {
+							return result, fmt.Errorf("MCP server appears dead after reconnection attempt")
+						}
+					} else {
+						// Success after reconnection - continue normally
+						e.logger.Info("Tool call succeeded after MCP reconnection")
+					}
+				}
+			}
 		}
 		
-		// Record failed tool call in history
-		e.recordToolCall(toolName, arguments, false, nil, abstractError, "Failed to execute")
-		
-		// Update execution context with error
-		if execCtx != nil {
-			e.updateExecutionContext(execCtx)
-			execCtx.LastError = abstractError
+		if err != nil {
+			// Error is already abstracted by MCP client, but add more context if needed
+			abstractError := err.Error()
+			e.logger.Error("  ✗ Tool execution failed")
+			e.logger.Error("    Tool: %s", toolName)
+			e.logger.Error("    Error: %s", abstractError)
+			
+			// Record failure in session
+			e.sessionManager.RecordFailure(sess.ID)
+			if e.db != nil {
+				if err := e.db.UpdateSession(sess); err != nil {
+					e.logger.Debug("Failed to update session in DB: %v", err)
+				}
+			}
+
+			// Track error pattern for deadlock detection
+			errorKey := fmt.Sprintf("%s:%s", toolName, abstractError)
+			e.errorPatterns[errorKey]++
+			consecutiveFailures := e.errorPatterns[errorKey]
+			
+			// Check for deadlock (same error 3+ times)
+			isDeadlock := consecutiveFailures >= 3
+			if isDeadlock {
+				e.logger.Warn("  ⚠ Deadlock detected: Same error repeated %d times", consecutiveFailures)
+			}
+			
+			// Ask LLM what to do with the session
+			if e.llmCoord != nil {
+				health := sess.GetHealth()
+			contextStr := ""
+			if execCtx != nil {
+				contextStr = e.buildContextString(execCtx, rule)
+			}
+			
+			sessionAction, reasoning, err := e.llmCoord.EvaluateSessionLifecycle(
+					toolType,
+					fmt.Sprintf("success_rate=%.2f, consecutive_failures=%d, total_ops=%d", 
+						health.SuccessRate, health.ConsecutiveFailures, health.TotalOperations),
+					abstractError,
+					health.ConsecutiveFailures,
+					health.TotalOperations,
+					health.SuccessRate,
+					contextStr,
+					func() string {
+						if execCtx != nil {
+							return execCtx.Objective
+						}
+						return ""
+					}(),
+				)
+				if err == nil {
+					e.logger.Info("LLM session decision: %s", sessionAction)
+					e.logger.Debug("LLM reasoning: %s", reasoning)
+					
+					// Execute LLM session decision
+					switch sessionAction {
+					case "close":
+						e.logger.Warn("LLM decided to close session %s", sess.ID)
+						e.sessionManager.CloseSession(sess.ID)
+						if e.db != nil {
+							e.db.CloseSession(sess.ID)
+						}
+						delete(e.currentSessions, toolType)
+					case "recover":
+						e.logger.Info("LLM decided to recover session %s", sess.ID)
+						e.sessionManager.UpdateState(sess.ID, session.StateRecovering)
+						if e.db != nil {
+							e.db.UpdateSession(sess)
+						}
+					case "recreate":
+						e.logger.Info("LLM decided to recreate session for %s", toolType)
+						e.sessionManager.CloseSession(sess.ID)
+						if e.db != nil {
+							e.db.CloseSession(sess.ID)
+						}
+						delete(e.currentSessions, toolType)
+						// New session will be created on next call
+					case "keep_alive":
+						fallthrough
+					default:
+						e.logger.Debug("LLM decided to keep session alive")
+						// Session remains active
+					}
+				}
+			}
+			
+			// Record failed tool call in history
+			e.recordToolCall(toolName, arguments, false, nil, abstractError, "Failed to execute")
+			
+			// Update execution context with error
+			if execCtx != nil {
+				e.updateExecutionContext(execCtx)
+				execCtx.LastError = abstractError
+			}
+			
+			result.ToolCalls = append(result.ToolCalls, llm.ToolCall{
+				Name:      toolName,
+				Arguments: arguments,
+			})
+			result.Error = fmt.Errorf("tool %s failed: %s", toolName, abstractError)
+			result.Success = false
+			result.Retryable = e.isRetryableError(err)
+			result.Duration = time.Since(startTime)
+			
+			// Store deadlock info in result for handling
+			if isDeadlock {
+				// Add deadlock flag to error message
+				result.Error = fmt.Errorf("DEADLOCK: %v (repeated %d times)", result.Error, consecutiveFailures)
+			}
+			
+			return result, result.Error
 		}
-		
-		result.ToolCalls = append(result.ToolCalls, llm.ToolCall{
-			Name:      toolName,
-			Arguments: arguments,
-		})
-		result.Error = fmt.Errorf("tool %s failed: %s", toolName, abstractError)
-		result.Success = false
-		result.Retryable = e.isRetryableError(err)
-		result.Duration = time.Since(startTime)
-		
-		// Store deadlock info in result for handling
-		if isDeadlock {
-			// Add deadlock flag to error message
-			result.Error = fmt.Errorf("DEADLOCK: %v (repeated %d times)", result.Error, consecutiveFailures)
+	}
+	
+	// Success - record in session
+	e.sessionManager.RecordSuccess(sess.ID)
+	if e.db != nil {
+		if err := e.db.UpdateSession(sess); err != nil {
+			e.logger.Debug("Failed to update session in DB: %v", err)
 		}
-		
-		return result, result.Error
 	}
 	
 	// Success - reset error pattern for this tool
@@ -216,28 +567,32 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 			delete(e.errorPatterns, key)
 		}
 	}
-
-	// Parse result
+	
+	// Record successful tool call in history
+	e.recordToolCall(toolName, arguments, true, toolResult, "", "Successfully executed")
+	
+	// Update execution context with success
+	if execCtx != nil {
+		e.updateExecutionContext(execCtx)
+		execCtx.LastError = ""
+	}
+	
+	// Parse tool result
 	var parsedResult interface{}
 	if err := json.Unmarshal(toolResult, &parsedResult); err != nil {
 		parsedResult = string(toolResult)
 	}
-
-	// Determine consequence of this tool call
-	consequence := e.determineToolConsequence(toolName, arguments, parsedResult)
-
-	// Record successful tool call in history
-	e.recordToolCall(toolName, arguments, true, parsedResult, "", consequence)
-
+	
+	result.Result = parsedResult
+	result.Success = true
+	result.Duration = time.Since(startTime)
 	result.ToolCalls = append(result.ToolCalls, llm.ToolCall{
 		Name:      toolName,
 		Arguments: arguments,
 	})
-	result.Success = true
-	result.Result = parsedResult
-	result.Duration = time.Since(startTime)
 	
-	e.logger.Info("  ✓ Tool completed: %s", toolName)
+	// Determine consequence of this tool call
+	consequence := e.determineToolConsequence(toolName, arguments, parsedResult)
 	e.logger.Debug("  Consequence: %s", consequence)
 	
 	// Update execution context with latest state
@@ -252,7 +607,7 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 }
 
 // buildExecutionContext builds execution context from current state
-func (e *Executor) buildExecutionContext(subtaskName, context string) *ExecutionContext {
+func (e *Executor) buildExecutionContext(subtaskName string, context string) *ExecutionContext {
 	// Create a copy of execution history for context
 	historyCopy := make([]ToolCallResult, len(e.executionHistory))
 	copy(historyCopy, e.executionHistory)
@@ -543,5 +898,74 @@ func (e *Executor) RestoreState(stateJSON string) error {
 	// (cookies, localStorage, form data, etc.)
 	
 	return nil
+}
+
+// ReestablishBrowserSession attempts to re-establish a lost browser session
+// This is used when deadlock is detected due to session loss
+func (e *Executor) ReestablishBrowserSession(stateJSON string) error {
+	e.logger.Info("Attempting to re-establish browser session...")
+	
+	// Try to find a URL from state snapshot or execution history
+	var targetURL string
+	
+	// First, try to get URL from state snapshot
+	if stateJSON != "" && stateJSON != "{}" {
+		var stateData map[string]interface{}
+		if err := json.Unmarshal([]byte(stateJSON), &stateData); err == nil {
+			if url, ok := stateData["url"].(string); ok && url != "" {
+				targetURL = url
+			}
+		}
+	}
+	
+	// If no URL in snapshot, try to find last successful navigation from history
+	if targetURL == "" {
+		for i := len(e.executionHistory) - 1; i >= 0; i-- {
+			call := e.executionHistory[i]
+			if call.Success {
+				// Check if this was a navigation call
+				if call.ToolName == "browser_navigate" || call.ToolName == "mcp_playwright_browser_navigate" {
+					if url, ok := call.Arguments["url"].(string); ok && url != "" {
+						targetURL = url
+						e.logger.Debug("Found URL from navigation history: %s", targetURL)
+						break
+					}
+				}
+			}
+		}
+	}
+	
+	// If still no URL, use a default or skip
+	if targetURL == "" {
+		e.logger.Warn("No URL found to re-establish session - browser session may need manual intervention")
+		return fmt.Errorf("no URL available to re-establish browser session")
+	}
+	
+	// Try to navigate to re-establish the session
+	e.logger.Info("Navigating to %s to re-establish browser session", targetURL)
+	
+	// Try different possible tool names for navigation
+	navigationTools := []string{
+		"browser_navigate",
+		"mcp_playwright_browser_navigate",
+		"navigate",
+	}
+	
+	var lastErr error
+	for _, toolName := range navigationTools {
+		_, err := e.mcpClient.CallTool(toolName, map[string]interface{}{
+			"url": targetURL,
+		})
+		if err == nil {
+			e.logger.Info("Browser session re-established successfully by navigating to %s", targetURL)
+			// Clear error patterns since we've recovered
+			e.errorPatterns = make(map[string]int)
+			return nil
+		}
+		lastErr = err
+		e.logger.Debug("Failed to navigate with tool %s: %v", toolName, err)
+	}
+	
+	return fmt.Errorf("failed to re-establish browser session: %w", lastErr)
 }
 

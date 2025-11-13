@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -626,10 +627,11 @@ Available actions:
 - "end_task": End the entire task
 - "recover_state": Attempt to recover tool state and retry
 - "adjust_approach": Suggest a different approach for this subtask
+- "keep_session": Keep the session alive and retry (preserve session state - sessions are valuable)
 
 You must respond with valid JSON:
 {
-  "action": "string - one of: skip, end_cycle, end_task, recover_state, adjust_approach",
+  "action": "string - one of: skip, end_cycle, end_task, recover_state, adjust_approach, keep_session",
   "reasoning": "string - detailed explanation",
   "suggestion": "string - optional suggestion for recovery or adjustment"
 }`
@@ -650,7 +652,8 @@ What should we do?
 - End cycle if this subtask is blocking?
 - End task if objective cannot be achieved?
 - Recover state if tool state was lost?
-- Adjust approach if a different method might work?`, subtaskName, toolName, errorMessage, retryCount, maxRetries, objective, executionContext)
+- Adjust approach if a different method might work?
+- Keep session alive and retry if session is healthy and error might be transient?`, subtaskName, toolName, errorMessage, retryCount, maxRetries, objective, executionContext)
 
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
@@ -790,5 +793,213 @@ What should we do to recover?
 	}
 
 	return result.Action, reasoning, nil
+}
+
+// EvaluateSessionLifecycle evaluates what to do with a session when errors occur
+func (c *Coordinator) EvaluateSessionLifecycle(
+	toolType string,
+	sessionHealth string,
+	errorMessage string,
+	consecutiveFailures int,
+	totalOperations int,
+	successRate float64,
+	executionContext string,
+	objective string,
+) (string, string, error) {
+	systemPrompt := `You are an intelligent session lifecycle manager. Your job is to decide what to do with tool sessions when errors occur.
+
+CRITICAL PRINCIPLES:
+- Sessions are VALUABLE - they represent established connections/state that took time to create
+- Only close sessions when ABSOLUTELY necessary (e.g., unrecoverable errors, explicit user request)
+- Default to PRESERVING sessions - errors may be transient
+- Consider session health: healthy sessions should be preserved even on errors
+- Think about tool consequences: closing a session means losing all state and requiring re-establishment
+
+Available actions:
+- "keep_alive": Keep the session alive and retry the operation (default for healthy sessions)
+- "recover": Attempt to recover the session state (e.g., reconnect, restore state)
+- "recreate": Create a new session (only if current session is unrecoverable)
+- "close": Close the session (only if explicitly needed or session is completely broken)
+
+You must respond with valid JSON:
+{
+  "action": "string - one of: keep_alive, recover, recreate, close",
+  "reasoning": "string - detailed explanation",
+  "should_preserve": boolean - whether session should be preserved
+}`
+
+	userPrompt := fmt.Sprintf(`Evaluate session lifecycle decision:
+
+Tool Type: %s
+Session Health: %s
+Error: %s
+Consecutive Failures: %d
+Total Operations: %d
+Success Rate: %.2f%%
+Objective: %s
+
+Execution Context:
+%s
+
+What should we do with this session?
+- Keep alive if session is healthy and error might be transient?
+- Recover if session state might be lost but recoverable?
+- Recreate if session is completely broken?
+- Close only if explicitly necessary?
+
+Remember: Sessions are valuable - preserve them unless there's a strong reason to close.`, 
+		toolType, sessionHealth, errorMessage, consecutiveFailures, totalOperations, successRate*100, objective, executionContext)
+
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
+	}
+
+	resp, err := c.client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model:       c.model,
+			Messages:    messages,
+			Temperature: 0.3, // Lower temperature for consistent decisions
+			ResponseFormat: &openai.ChatCompletionResponseFormat{
+				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+			},
+		},
+	)
+	if err != nil {
+		return "keep_alive", "", fmt.Errorf("LLM evaluation failed: %w", err)
+	}
+
+	// Record token usage
+	c.recordTokenUsage(resp.Usage, "session_lifecycle_evaluation")
+
+	content := resp.Choices[0].Message.Content
+	// Clean up markdown code blocks if present
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, "```json") {
+		content = strings.TrimPrefix(content, "```json")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	} else if strings.HasPrefix(content, "```") {
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	}
+
+	var result struct {
+		Action        string `json:"action"`
+		Reasoning     string `json:"reasoning"`
+		ShouldPreserve bool  `json:"should_preserve"`
+	}
+
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return "keep_alive", "", fmt.Errorf("failed to parse LLM response: %w", err)
+	}
+
+	return result.Action, result.Reasoning, nil
+}
+
+// EvaluateMCPHealth evaluates MCP server health and decides what to do
+func (c *Coordinator) EvaluateMCPHealth(
+	mcpHealth string,
+	consecutiveFailures int,
+	reconnectAttempts int,
+	timeSinceLastSuccess time.Duration,
+	executionContext string,
+	objective string,
+	taskProgress string,
+) (string, string, error) {
+	systemPrompt := `You are an intelligent MCP health evaluator. Your job is to determine if the MCP server is dead or recoverable.
+
+CRITICAL UNDERSTANDING:
+- MCP (Model Context Protocol) server provides tools needed for task execution
+- If MCP server is completely dead, task cannot proceed
+- Connection failures may be transient (network issues, server restart)
+- Repeated failures after reconnection attempts indicate server death
+- Task progress should be considered: if near completion, may be worth waiting
+
+Available actions:
+- "continue": Continue task execution (MCP is healthy or recoverable)
+- "retry_connection": Retry MCP connection (server may be temporarily unavailable)
+- "stop_task": Stop entire task execution (MCP is dead and cannot be recovered)
+
+You must respond with valid JSON:
+{
+  "action": "string - one of: continue, retry_connection, stop_task",
+  "reasoning": "string - detailed explanation",
+  "mcp_status": "string - one of: healthy, degraded, unresponsive, dead"
+}`
+
+	userPrompt := fmt.Sprintf(`Evaluate MCP server health:
+
+MCP Health Status: %s
+Consecutive Failures: %d
+Reconnection Attempts: %d
+Time Since Last Success: %v
+Objective: %s
+Task Progress: %s
+
+Execution Context:
+%s
+
+What should we do?
+- Continue if MCP is healthy or failures are transient?
+- Retry connection if server may be temporarily unavailable?
+- Stop task if MCP is dead and cannot be recovered?
+
+Consider:
+- If failures are recent and few, may be transient
+- If many failures after reconnection attempts, server likely dead
+- If task is near completion, may be worth waiting
+- If task just started, better to stop early`, 
+		mcpHealth, consecutiveFailures, reconnectAttempts, timeSinceLastSuccess, objective, taskProgress, executionContext)
+
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
+	}
+
+	resp, err := c.client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model:       c.model,
+			Messages:    messages,
+			Temperature: 0.3, // Lower temperature for consistent decisions
+			ResponseFormat: &openai.ChatCompletionResponseFormat{
+				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+			},
+		},
+	)
+	if err != nil {
+		return "continue", "", fmt.Errorf("LLM evaluation failed: %w", err)
+	}
+
+	// Record token usage
+	c.recordTokenUsage(resp.Usage, "mcp_health_evaluation")
+
+	content := resp.Choices[0].Message.Content
+	// Clean up markdown code blocks if present
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, "```json") {
+		content = strings.TrimPrefix(content, "```json")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	} else if strings.HasPrefix(content, "```") {
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	}
+
+	var result struct {
+		Action     string `json:"action"`
+		Reasoning  string `json:"reasoning"`
+		MCPStatus  string `json:"mcp_status"`
+	}
+
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return "continue", "", fmt.Errorf("failed to parse LLM response: %w", err)
+	}
+
+	return result.Action, result.Reasoning, nil
 }
 
