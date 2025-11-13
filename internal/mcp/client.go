@@ -28,6 +28,7 @@ type Client struct {
 	sseURL     string
 	sseStream  io.ReadCloser
 	sseCancel  context.CancelFunc
+	sessionID  string
 	connected  bool
 	serverInfo *ServerInfo
 	mu         sync.Mutex
@@ -93,11 +94,11 @@ func NewClient(def *MCPDefinition) *Client {
 // Connect establishes connection to MCP server
 func (c *Client) Connect() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if c.connected {
+		c.mu.Unlock()
 		return nil
 	}
+	c.mu.Unlock()
 
 	switch c.def.Transport.Type {
 	case "stdio":
@@ -196,10 +197,15 @@ func (c *Client) connectSSE() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.sseCancel = cancel
 
-	// Create initialize request
+	// Create initialize request with proper ID
+	c.mu.Lock()
+	c.requestID++
+	initID := c.requestID
+	c.mu.Unlock()
+
 	initReq := Request{
 		JSONRPC: "2.0",
-		ID:      1,
+		ID:      initID,
 		Method:  "initialize",
 		Params: map[string]interface{}{
 			"protocolVersion": "2024-11-05",
@@ -255,24 +261,32 @@ func (c *Client) connectSSE() error {
 		return fmt.Errorf("expected SSE stream but got content-type: %s, body: %s", contentType, string(bodyBytes))
 	}
 
+	// Capture session ID from response headers
+	sessionID := resp.Header.Get("mcp-session-id")
+	if sessionID != "" {
+		c.sessionID = sessionID
+	}
+
 	c.sseURL = baseURL
 
 	// Store SSE stream
 	c.sseStream = resp.Body
 
+	// Create pending channel BEFORE starting goroutine to avoid race condition
+	ch := make(chan *Response, 1)
+	c.mu.Lock()
+	c.pending[initID] = ch
+	pendingCount := len(c.pending)
+	c.mu.Unlock()
+
 	// Start reading SSE events
 	go c.handleSSEStream()
 
 	// Wait for initialize response (we already sent it in the POST)
-	ch := make(chan *Response, 1)
-	c.mu.Lock()
-	c.pending[1] = ch
-	c.mu.Unlock()
-
 	select {
 	case initResp := <-ch:
 		c.mu.Lock()
-		delete(c.pending, 1)
+		delete(c.pending, initID)
 		c.mu.Unlock()
 
 		if initResp.Error != nil {
@@ -302,10 +316,10 @@ func (c *Client) connectSSE() error {
 		return nil
 	case <-time.After(10 * time.Second):
 		c.mu.Lock()
-		delete(c.pending, 1)
+		delete(c.pending, initID)
 		c.mu.Unlock()
 		c.sseStream.Close()
-		return fmt.Errorf("timeout waiting for initialize response")
+		return fmt.Errorf("timeout waiting for initialize response (ID %d)", initID)
 	}
 }
 
@@ -433,7 +447,10 @@ func (c *Client) handleSSEStream() {
 		return
 	}
 
-	scanner := bufio.NewScanner(c.sseStream)
+	reader := bufio.NewReader(c.sseStream)
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
 	var currentData string
 	var expectingData bool
 
@@ -491,11 +508,6 @@ func (c *Client) handleSSEStream() {
 				}
 			}
 		}
-	}
-
-	// Stream closed
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		fmt.Fprintf(os.Stderr, "[MCP SSE Stream] Error: %v\n", err)
 	}
 }
 
@@ -563,8 +575,8 @@ func (c *Client) callHTTP(data []byte) (*Response, error) {
 		return nil, fmt.Errorf("failed to parse request: %w", err)
 	}
 
-	// If SSE is active, send via POST to the base URL and wait for SSE response
-	if c.sseStream != nil {
+	// If SSE URL is set, use SSE transport for this call
+	if c.sseURL != "" {
 		return c.callSSE(data, req.ID)
 	}
 
@@ -645,7 +657,7 @@ func (c *Client) callHTTP(data []byte) (*Response, error) {
 }
 
 func (c *Client) callSSE(data []byte, requestID int64) (*Response, error) {
-	// For SSE, send POST request to base URL (not /messages)
+	// For SSE with Playwright MCP, each request establishes its own SSE connection
 	baseURL := c.sseURL
 	if strings.HasSuffix(baseURL, "/messages") {
 		baseURL = strings.TrimSuffix(baseURL, "/messages")
@@ -660,39 +672,70 @@ func (c *Client) callSSE(data []byte, requestID int64) (*Response, error) {
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+
+	// Include session ID if we have one
+	if c.sessionID != "" {
+		httpReq.Header.Set("mcp-session-id", c.sessionID)
+	}
+
 	if c.def.Transport.HTTP != nil && c.def.Transport.HTTP.Headers != nil {
 		for k, v := range c.def.Transport.HTTP.Headers {
 			httpReq.Header.Set(k, v)
 		}
 	}
 
-	// Send the request (response will come via SSE stream)
-	_, err = c.httpClient.Do(httpReq)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	httpReq = httpReq.WithContext(ctx)
+
+	// Send request and get SSE stream
+	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("SSE POST request failed: %w", err)
 	}
+	defer resp.Body.Close()
 
-	// Wait for response on SSE stream
-	ch := make(chan *Response, 1)
-	c.mu.Lock()
-	c.pending[requestID] = ch
-	c.mu.Unlock()
-
-	defer func() {
-		c.mu.Lock()
-		delete(c.pending, requestID)
-		c.mu.Unlock()
-	}()
-
-	select {
-	case mcpResp := <-ch:
-		if mcpResp.Error != nil {
-			return nil, fmt.Errorf("MCP error: %s (code: %d)", mcpResp.Error.Message, mcpResp.Error.Code)
-		}
-		return mcpResp, nil
-	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("request timeout waiting for SSE response")
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("SSE POST failed with status: %d, body: %s", resp.StatusCode, string(bodyBytes))
 	}
+
+	// Read SSE stream from this response
+	scanner := bufio.NewScanner(resp.Body)
+	var currentData string
+	var expectingData bool
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if strings.HasPrefix(line, "event: ") {
+			currentData = ""
+			expectingData = true
+		} else if strings.HasPrefix(line, "data: ") && expectingData {
+			jsonData := strings.TrimPrefix(line, "data: ")
+			currentData = jsonData
+		} else if line == "" && currentData != "" {
+			// Parse and return the response
+			var mcpResp Response
+			if err := json.Unmarshal([]byte(currentData), &mcpResp); err != nil {
+				return nil, fmt.Errorf("failed to parse SSE response: %w, data: %s", err, currentData)
+			}
+
+			if mcpResp.ID == requestID {
+				if mcpResp.Error != nil {
+					return nil, fmt.Errorf("MCP error: %s (code: %d)", mcpResp.Error.Message, mcpResp.Error.Code)
+				}
+				return &mcpResp, nil
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read SSE stream: %w", err)
+	}
+
+	return nil, fmt.Errorf("no matching response found for request ID %d", requestID)
 }
 
 func (c *Client) notify(method string, params interface{}) error {
