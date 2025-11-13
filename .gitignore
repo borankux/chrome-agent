@@ -1,0 +1,41 @@
+# Build artifacts
+/chrome-agent
+/bin/
+/build/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage and profiling
+*.cover
+*.coverprofile
+coverage.txt
+profile.out
+
+# Logs, caches, and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+*.DS_Store
+
+# Database and state files
+*.db
+*.sqlite
+*.sqlite3
+agent.db
+
+# Local configuration
+.env
+mcp-config.json
+task.txt
+
+# IDE/tooling metadata
+.idea/
+.vscode/
+*.iml

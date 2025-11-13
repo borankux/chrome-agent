@@ -17,6 +17,7 @@ type Executor struct {
 	llmCoord       *llm.Coordinator
 	logger         *logger.Logger
 	executionHistory []ToolCallResult // Track tool execution history
+	errorPatterns   map[string]int     // Track consecutive errors for deadlock detection
 }
 
 // ExecutionResult contains execution result
@@ -58,7 +59,13 @@ func NewExecutor(mcpClient *mcp.Client, llmCoord *llm.Coordinator, log *logger.L
 		llmCoord:       llmCoord,
 		logger:         log,
 		executionHistory: make([]ToolCallResult, 0),
+		errorPatterns:   make(map[string]int),
 	}
+}
+
+// GetLLMCoordinator returns the LLM coordinator
+func (e *Executor) GetLLMCoordinator() *llm.Coordinator {
+	return e.llmCoord
 }
 
 // ValidateToolAccessible checks if a tool exists and is accessible
@@ -164,6 +171,17 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 		e.logger.Error("    Tool: %s", toolName)
 		e.logger.Error("    Error: %s", abstractError)
 		
+		// Track error pattern for deadlock detection
+		errorKey := fmt.Sprintf("%s:%s", toolName, abstractError)
+		e.errorPatterns[errorKey]++
+		consecutiveFailures := e.errorPatterns[errorKey]
+		
+		// Check for deadlock (same error 3+ times)
+		isDeadlock := consecutiveFailures >= 3
+		if isDeadlock {
+			e.logger.Warn("  ⚠ Deadlock detected: Same error repeated %d times", consecutiveFailures)
+		}
+		
 		// Record failed tool call in history
 		e.recordToolCall(toolName, arguments, false, nil, abstractError, "Failed to execute")
 		
@@ -181,7 +199,22 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 		result.Success = false
 		result.Retryable = e.isRetryableError(err)
 		result.Duration = time.Since(startTime)
+		
+		// Store deadlock info in result for handling
+		if isDeadlock {
+			// Add deadlock flag to error message
+			result.Error = fmt.Errorf("DEADLOCK: %v (repeated %d times)", result.Error, consecutiveFailures)
+		}
+		
 		return result, result.Error
+	}
+	
+	// Success - reset error pattern for this tool
+	errorKey := fmt.Sprintf("%s:", toolName)
+	for key := range e.errorPatterns {
+		if strings.HasPrefix(key, errorKey) {
+			delete(e.errorPatterns, key)
+		}
 	}
 
 	// Parse result
@@ -413,6 +446,11 @@ func (e *Executor) determineToolWithContext(rule SubtaskRule, execCtx *Execution
 
 	toolCall := reasoning.ToolCalls[0]
 	return toolCall.Name, toolCall.Arguments, nil
+}
+
+// BuildContextString builds a rich context string for LLM (exported for use by loop manager)
+func (e *Executor) BuildContextString(execCtx *ExecutionContext, rule SubtaskRule) string {
+	return e.buildContextString(execCtx, rule)
 }
 
 // buildContextString builds a rich context string for LLM

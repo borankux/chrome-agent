@@ -14,6 +14,9 @@ type Model struct {
 	execution ExecutionModel
 	logs      LogsModel
 	stats     StatsModel
+	errors    ErrorModel
+	prompts   PromptModel
+	commands  CommandModel
 	
 	width     int
 	height    int
@@ -34,6 +37,9 @@ func NewModel() *Model {
 		execution: NewExecutionModel(),
 		logs:      NewLogsModel(),
 		stats:     NewStatsModel(),
+		errors:    NewErrorModel(),
+		prompts:   NewPromptModel(),
+		commands:  NewCommandModel(),
 		width:     80,
 		height:    24,
 		taskState: &TaskState{},
@@ -64,9 +70,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.execution, _ = m.execution.Update(resizeMsg)
 		m.stats, _ = m.stats.Update(resizeMsg)
 		m.logs, _ = m.logs.Update(resizeMsg)
+		m.errors, _ = m.errors.Update(resizeMsg)
+		m.prompts, _ = m.prompts.Update(resizeMsg)
+		m.commands, _ = m.commands.Update(resizeMsg)
 		return m, nil
 		
 	case tea.KeyMsg:
+		// Handle prompts first (they have priority)
+		if m.prompts.active {
+			var cmd tea.Cmd
+			m.prompts, cmd = m.prompts.Update(msg)
+			return m, cmd
+		}
+		
+		// Handle commands
+		m.commands, _ = m.commands.Update(msg)
+		
+		// Handle general keyboard shortcuts
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -78,6 +98,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "end":
 			m.logs = m.logs.ScrollToBottom()
+			return m, nil
+		case "e":
+			m.errors, _ = m.errors.Update(msg)
 			return m, nil
 		}
 		
@@ -100,6 +123,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statsData = msg.Stats
 		m.stats, _ = m.stats.Update(msg)
 		return m, nil
+		
+	case ErrorMsg:
+		m.errors, _ = m.errors.Update(msg)
+		return m, nil
+		
+	case LLMPromptMsg:
+		var cmd tea.Cmd
+		m.prompts, cmd = m.prompts.Update(msg)
+		return m, cmd
+		
+	case PromptDismissMsg:
+		var cmd tea.Cmd
+		m.prompts, cmd = m.prompts.Update(msg)
+		return m, cmd
 		
 	case error:
 		return m, tea.Quit
@@ -134,6 +171,7 @@ func (m Model) View() string {
 	execution := m.execution.View()
 	logs := m.logs.View()
 	stats := m.stats.View()
+	errorsView := m.errors.View()
 	
 	// Combine all panels
 	panels := []string{header}
@@ -143,12 +181,34 @@ func (m Model) View() string {
 	if execution != "" {
 		panels = append(panels, execution)
 	}
+	if errorsView != "" {
+		panels = append(panels, errorsView)
+	}
 	panels = append(panels, logs)
 	if stats != "" {
 		panels = append(panels, stats)
 	}
 	
-	return lipgloss.JoinVertical(lipgloss.Left, panels...)
+	view := lipgloss.JoinVertical(lipgloss.Left, panels...)
+	
+	// Overlay prompts and help if active
+	if m.prompts.active {
+		promptView := m.prompts.View()
+		// Overlay prompt on top
+		return lipgloss.JoinVertical(lipgloss.Center,
+			view,
+			"\n",
+			promptView,
+		)
+	}
+	
+	if m.commands.showHelp {
+		helpView := m.commands.View()
+		// Overlay help on top of everything
+		return helpView
+	}
+	
+	return view
 }
 
 // Listen for updates from channels
@@ -220,5 +280,25 @@ func Start() (*Model, error) {
 // Stop stops the TUI
 func (m *Model) Stop() {
 	close(m.quitChan)
+}
+
+// SendError sends an error to the TUI error panel
+func (m *Model) SendError(err *ErrorInfo) {
+	m.SendUpdate(ErrorMsg{Error: err})
+}
+
+// SendPrompt sends an LLM prompt to the TUI
+func (m *Model) SendPrompt(promptType, context string, options []string, callback func(string)) {
+	m.SendUpdate(LLMPromptMsg{
+		Type:     promptType,
+		Context:  context,
+		Options:  options,
+		Callback: callback,
+	})
+}
+
+// DismissPrompt dismisses the current prompt
+func (m *Model) DismissPrompt() {
+	m.SendUpdate(PromptDismissMsg{})
 }
 

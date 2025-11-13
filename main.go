@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -427,7 +428,116 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 			if subtask.RetryCount >= subtask.MaxRetries {
 				log.Error("Retry limit (%d) exceeded for subtask '%s'", subtask.MaxRetries, rule.Name)
 				
-				// Handle exception
+				// Check for deadlock first
+				isDeadlock := strings.Contains(execErr.Error(), "DEADLOCK:")
+				if isDeadlock {
+					log.Warn("Deadlock detected in retry exhaustion, asking LLM for recovery")
+					
+					// Use executor's LLM coordinator
+					llmCoord := executor.GetLLMCoordinator()
+					if llmCoord != nil {
+						contextStr := executor.BuildContextString(execCtx, rule)
+						action, reasoning, err := llmCoord.EvaluateDeadlock(
+							rule.Name,
+							"",
+							execErr.Error(),
+							3,
+							contextStr,
+							spec.Objective,
+						)
+						if err == nil {
+							log.Info("LLM deadlock recovery decision: %s", action)
+							log.Debug("LLM reasoning: %s", reasoning)
+							
+							// Send prompt to TUI if available
+							if tuiModel != nil {
+								options := []string{"recover_state", "skip", "adjust_approach", "end_task"}
+								tuiModel.SendPrompt("deadlock", reasoning, options, func(selected string) {
+									action = selected
+								})
+							}
+							
+							// Execute decision
+							switch action {
+							case "end_task":
+								return fmt.Errorf("LLM decided to end task due to deadlock: %w", execErr)
+							case "recover_state":
+								log.Info("Attempting state recovery...")
+								if savedStateSnapshot == "" {
+									snapshot, err := taskManager.GetLatestStateSnapshot(subtaskID)
+									if err == nil && snapshot != nil {
+										savedStateSnapshot = snapshot.SnapshotData
+									}
+								}
+								if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+									if err := executor.RestoreState(savedStateSnapshot); err != nil {
+										log.Warn("State recovery failed: %v", err)
+									}
+								}
+								// Reset and try once more
+								subtask.RetryCount = 0
+								continue
+							case "skip", "adjust_approach":
+								log.Info("Skipping subtask per LLM decision")
+								break
+							}
+						}
+					}
+				}
+				
+				// Ask LLM what to do when retries are exhausted
+				llmCoord := executor.GetLLMCoordinator()
+				if llmCoord != nil {
+						contextStr := executor.BuildContextString(execCtx, rule)
+					action, reasoning, err := llmCoord.EvaluateRetryExhaustion(
+						rule.Name,
+						"",
+						execErr.Error(),
+						subtask.RetryCount,
+						subtask.MaxRetries,
+						contextStr,
+						spec.Objective,
+					)
+					if err == nil {
+						log.Info("LLM retry exhaustion decision: %s", action)
+						log.Debug("LLM reasoning: %s", reasoning)
+						
+						// Send prompt to TUI if available
+						if tuiModel != nil {
+							options := []string{"skip", "end_task", "recover_state", "adjust_approach"}
+							tuiModel.SendPrompt("retry_exhaustion", reasoning, options, func(selected string) {
+								action = selected
+							})
+						}
+						
+						// Execute LLM decision
+						switch action {
+						case "end_task":
+							return fmt.Errorf("LLM decided to end task after retry exhaustion: %w", execErr)
+						case "recover_state":
+							log.Info("Attempting state recovery per LLM decision...")
+							if savedStateSnapshot == "" {
+								snapshot, err := taskManager.GetLatestStateSnapshot(subtaskID)
+								if err == nil && snapshot != nil {
+									savedStateSnapshot = snapshot.SnapshotData
+								}
+							}
+							if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
+								if err := executor.RestoreState(savedStateSnapshot); err != nil {
+									log.Warn("State recovery failed: %v", err)
+								}
+							}
+							// Reset retry count and try once more
+							subtask.RetryCount = 0
+							continue
+						case "skip", "adjust_approach":
+							log.Info("Skipping subtask per LLM decision")
+							break
+						}
+					}
+				}
+				
+				// Handle exception (fallback)
 				needsIntervention, handleErr := exceptionHandler.HandleException(subtaskID, execErr)
 				if handleErr != nil {
 					return fmt.Errorf("failed to handle exception: %w", handleErr)

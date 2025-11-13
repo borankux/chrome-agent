@@ -526,3 +526,269 @@ Remember:
 	return content, nil
 }
 
+// EvaluateLoopCompletion evaluates whether a loop should continue or complete using LLM
+func (c *Coordinator) EvaluateLoopCompletion(executionContext string, loopType string, progress float64, target float64, cycleNumber int, objective string) (bool, string, error) {
+	systemPrompt := `You are an intelligent loop completion evaluator. Your job is to determine if a loop should continue or complete based on execution context and progress.
+
+CRITICAL UNDERSTANDING:
+- Loops can complete EARLY if the objective is achieved before reaching the target
+- Loops should CONTINUE if progress is being made toward the objective
+- Loops should COMPLETE if the objective is clearly achieved or if continuing would be wasteful
+- Consider both mechanical progress (time/quota) AND actual objective achievement
+
+You must respond with valid JSON:
+{
+  "should_complete": boolean - true if loop should complete, false if should continue,
+  "reasoning": "string - detailed explanation of your decision",
+  "objective_achieved": boolean - whether the actual objective has been achieved,
+  "confidence": number - confidence level 0.0 to 1.0
+}`
+
+	userPrompt := fmt.Sprintf(`Evaluate loop completion:
+
+Objective: %s
+Loop Type: %s
+Current Progress: %.2f
+Target: %.2f
+Cycle Number: %d
+
+Execution Context:
+%s
+
+Based on this information, determine:
+1. Has the objective been achieved? (even if progress < target)
+2. Should the loop continue or complete?
+3. What is your reasoning?
+
+Consider:
+- If objective is achieved early, complete the loop
+- If making good progress toward objective, continue
+- If stuck or making no progress, consider completing
+- Balance between efficiency and thoroughness`, objective, loopType, progress, target, cycleNumber, executionContext)
+
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
+	}
+
+	resp, err := c.client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model:       c.model,
+			Messages:    messages,
+			Temperature: 0.3, // Lower temperature for more consistent decisions
+			ResponseFormat: &openai.ChatCompletionResponseFormat{
+				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+			},
+		},
+	)
+	if err != nil {
+		return false, "", fmt.Errorf("LLM evaluation failed: %w", err)
+	}
+
+	// Record token usage
+	c.recordTokenUsage(resp.Usage, "loop_completion_evaluation")
+
+	content := resp.Choices[0].Message.Content
+	// Clean up markdown code blocks if present
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, "```json") {
+		content = strings.TrimPrefix(content, "```json")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	} else if strings.HasPrefix(content, "```") {
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	}
+
+	var result struct {
+		ShouldComplete    bool    `json:"should_complete"`
+		Reasoning         string  `json:"reasoning"`
+		ObjectiveAchieved bool    `json:"objective_achieved"`
+		Confidence        float64 `json:"confidence"`
+	}
+
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return false, "", fmt.Errorf("failed to parse LLM response: %w", err)
+	}
+
+	return result.ShouldComplete, result.Reasoning, nil
+}
+
+// EvaluateRetryExhaustion evaluates what to do when retries are exhausted
+func (c *Coordinator) EvaluateRetryExhaustion(subtaskName string, toolName string, errorMessage string, retryCount int, maxRetries int, executionContext string, objective string) (string, string, error) {
+	systemPrompt := `You are an intelligent error recovery coordinator. When retry limits are exceeded, you must decide the best course of action.
+
+Available actions:
+- "skip": Skip this subtask and continue to next
+- "end_cycle": End current cycle and move to next cycle
+- "end_task": End the entire task
+- "recover_state": Attempt to recover tool state and retry
+- "adjust_approach": Suggest a different approach for this subtask
+
+You must respond with valid JSON:
+{
+  "action": "string - one of: skip, end_cycle, end_task, recover_state, adjust_approach",
+  "reasoning": "string - detailed explanation",
+  "suggestion": "string - optional suggestion for recovery or adjustment"
+}`
+
+	userPrompt := fmt.Sprintf(`Retry limit exceeded - decide next action:
+
+Subtask: %s
+Tool: %s
+Error: %s
+Retries: %d/%d
+Objective: %s
+
+Execution Context:
+%s
+
+What should we do?
+- Skip this subtask if it's not critical?
+- End cycle if this subtask is blocking?
+- End task if objective cannot be achieved?
+- Recover state if tool state was lost?
+- Adjust approach if a different method might work?`, subtaskName, toolName, errorMessage, retryCount, maxRetries, objective, executionContext)
+
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
+	}
+
+	resp, err := c.client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model:       c.model,
+			Messages:    messages,
+			Temperature: 0.5,
+			ResponseFormat: &openai.ChatCompletionResponseFormat{
+				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+			},
+		},
+	)
+	if err != nil {
+		return "skip", "", fmt.Errorf("LLM evaluation failed: %w", err)
+	}
+
+	// Record token usage
+	c.recordTokenUsage(resp.Usage, "retry_exhaustion_evaluation")
+
+	content := resp.Choices[0].Message.Content
+	// Clean up markdown code blocks if present
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, "```json") {
+		content = strings.TrimPrefix(content, "```json")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	} else if strings.HasPrefix(content, "```") {
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	}
+
+	var result struct {
+		Action     string `json:"action"`
+		Reasoning  string `json:"reasoning"`
+		Suggestion string `json:"suggestion"`
+	}
+
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return "skip", "", fmt.Errorf("failed to parse LLM response: %w", err)
+	}
+
+	return result.Action, result.Reasoning, nil
+}
+
+// EvaluateDeadlock evaluates what to do when a deadlock is detected
+func (c *Coordinator) EvaluateDeadlock(subtaskName string, toolName string, errorMessage string, consecutiveFailures int, executionContext string, objective string) (string, string, error) {
+	systemPrompt := `You are an intelligent deadlock detection and recovery coordinator. When the same error repeats multiple times, you must detect deadlock and suggest recovery.
+
+Available actions:
+- "recover_state": Re-establish tool state (e.g., reopen browser, reconnect)
+- "skip": Skip this operation and try alternative approach
+- "adjust_approach": Use a different method to achieve the same goal
+- "end_cycle": End current cycle and start fresh
+- "end_task": End task if deadlock cannot be resolved
+
+You must respond with valid JSON:
+{
+  "action": "string - one of: recover_state, skip, adjust_approach, end_cycle, end_task",
+  "reasoning": "string - detailed explanation",
+  "recovery_steps": ["string"] - optional steps to recover
+}`
+
+	userPrompt := fmt.Sprintf(`Deadlock detected - same error repeating:
+
+Subtask: %s
+Tool: %s
+Error: %s
+Consecutive Failures: %d
+Objective: %s
+
+Execution Context:
+%s
+
+This error has repeated %d times. This indicates a deadlock situation.
+What should we do to recover?
+- Recover tool state if state was lost?
+- Skip and try alternative approach?
+- Adjust the approach entirely?
+- End cycle and start fresh?
+- End task if recovery is impossible?`, subtaskName, toolName, errorMessage, consecutiveFailures, objective, executionContext, consecutiveFailures)
+
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
+	}
+
+	resp, err := c.client.CreateChatCompletion(
+		context.Background(),
+		openai.ChatCompletionRequest{
+			Model:       c.model,
+			Messages:    messages,
+			Temperature: 0.5,
+			ResponseFormat: &openai.ChatCompletionResponseFormat{
+				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+			},
+		},
+	)
+	if err != nil {
+		return "skip", "", fmt.Errorf("LLM evaluation failed: %w", err)
+	}
+
+	// Record token usage
+	c.recordTokenUsage(resp.Usage, "deadlock_evaluation")
+
+	content := resp.Choices[0].Message.Content
+	// Clean up markdown code blocks if present
+	content = strings.TrimSpace(content)
+	if strings.HasPrefix(content, "```json") {
+		content = strings.TrimPrefix(content, "```json")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	} else if strings.HasPrefix(content, "```") {
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+		content = strings.TrimSpace(content)
+	}
+
+	var result struct {
+		Action        string   `json:"action"`
+		Reasoning     string   `json:"reasoning"`
+		RecoverySteps []string `json:"recovery_steps"`
+	}
+
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return "skip", "", fmt.Errorf("failed to parse LLM response: %w", err)
+	}
+
+	reasoning := result.Reasoning
+	if len(result.RecoverySteps) > 0 {
+		reasoning += "\nRecovery steps: " + strings.Join(result.RecoverySteps, ", ")
+	}
+
+	return result.Action, reasoning, nil
+}
+
