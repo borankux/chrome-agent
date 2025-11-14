@@ -1,0 +1,22 @@
+Evaluate loop completion:
+
+Objective: %s
+Loop Type: %s
+Current Progress: %.2f
+Target: %.2f
+Cycle Number: %d
+
+Execution Context:
+%s
+
+Based on this information, determine:
+1. Has the objective been achieved? (even if progress < target)
+2. Should the loop continue or complete?
+3. What is your reasoning?
+
+Consider:
+- If objective is achieved early, complete the loop
+- If making good progress toward objective, continue
+- If stuck or making no progress, consider completing
+- Balance between efficiency and thoroughness
+

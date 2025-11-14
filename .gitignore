@@ -23,6 +23,7 @@ profile.out
 *.swp
 *.swo
 *.DS_Store
+/logs/
 
 # Database and state files
 *.db

@@ -1,7 +1,14 @@
 {
     "mcpServers": {
-      "playwright": {
+      "playwrigh": {
+        "command": "npx",
+        "args": [
+          "@playwright/mcp@latest"
+        ]
+      },
+      "playwright-fallback": {
         "url": "http://localhost:8931/mcp"
       }
     }
 }
+ 

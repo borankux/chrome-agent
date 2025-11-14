@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"chrome-agent/internal/llm"
 	"chrome-agent/internal/mcp"
 	"chrome-agent/internal/session"
@@ -23,6 +25,7 @@ type Executor struct {
 	sessionManager *session.Manager   // Session management
 	db             *state.DB          // Database for session persistence
 	currentSessions map[string]*session.Session // toolType -> Session
+	browserSessionID string           // Session ID for browser tools (shared across all browser tool calls)
 }
 
 // ExecutionResult contains execution result
@@ -142,6 +145,44 @@ func (e *Executor) getToolType(toolName string) string {
 		return parts[0]
 	}
 	return "unknown"
+}
+
+// generateBrowserSessionID generates a unique session ID for browser tools
+// Format: browser_{uuid} - one session ID per task execution
+// IMPORTANT: This should only be called once per executor instance to ensure
+// all browser tools use the same session_id and reuse the same browser tab
+func (e *Executor) generateBrowserSessionID() string {
+	if e.browserSessionID == "" {
+		e.browserSessionID = fmt.Sprintf("browser_%s", uuid.New().String())
+		e.logger.Info("Generated browser session ID: %s (will be reused for all browser tools)", e.browserSessionID)
+	} else {
+		e.logger.Debug("Reusing existing browser session ID: %s", e.browserSessionID)
+	}
+	return e.browserSessionID
+}
+
+// injectSessionID injects session_id into browser tool arguments if needed
+// This enables session persistence across multiple browser tool calls
+func (e *Executor) injectSessionID(toolName string, arguments map[string]interface{}) {
+	// Check if this is a browser tool
+	toolType := e.getToolType(toolName)
+	if toolType != "browser" {
+		// Not a browser tool, no session_id needed
+		return
+	}
+
+	// Check if session_id is already in arguments (LLM might have added it)
+	if _, exists := arguments["session_id"]; exists {
+		e.logger.Debug("Session ID already present in arguments for tool %s", toolName)
+		return
+	}
+
+	// Generate session ID if not already generated
+	sessionID := e.generateBrowserSessionID()
+
+	// Inject session_id into arguments
+	arguments["session_id"] = sessionID
+	e.logger.Debug("Injected session_id %s into browser tool %s", sessionID, toolName)
 }
 
 // getOrCreateSession gets or creates a session for a tool type
@@ -377,14 +418,70 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 		}
 	}
 
-	// Execute single tool call
+	// Inject session_id for browser tools (enables session persistence)
+	e.injectSessionID(toolName, arguments)
+
+	// Log concrete details before execution
+	e.logger.Info("Executing tool: %s", toolName)
+	e.logger.Info("Tool arguments: %v", arguments)
+	e.logger.Info("Session details - ID: %s, ToolType: %s, State: %s", sess.ID, toolType, sess.State)
+	
+	// Log browser session ID to track if it's consistent
+	if toolType == "browser" {
+		if sessionID, ok := arguments["session_id"].(string); ok {
+			e.logger.Info("Browser session_id being used: %s", sessionID)
+			if sessionID != e.browserSessionID {
+				e.logger.Warn("Session ID mismatch! Expected: %s, Got: %s", e.browserSessionID, sessionID)
+			}
+		} else {
+			e.logger.Warn("No session_id found in browser tool arguments!")
+		}
+	}
+	
+	// Check session health before execution (especially for browser tools)
+	if toolType == "browser" {
+		health := sess.GetHealth()
+		e.logger.Info("Session health - SuccessRate: %.2f, ConsecutiveFailures: %d, TotalOps: %d, IsHealthy: %v", 
+			health.SuccessRate, health.ConsecutiveFailures, health.TotalOperations, health.IsHealthy)
+		
+		if !health.IsHealthy && sess.State == session.StateActive {
+			e.logger.Warn("Session %s is unhealthy before tool execution - SuccessRate: %.2f, ConsecutiveFailures: %d", 
+				sess.ID, health.SuccessRate, health.ConsecutiveFailures)
+		}
+	}
+	
+	e.logger.Info("MCP Health - Status: %s, ConsecutiveFailures: %d, ReconnectAttempts: %d", 
+		mcpHealth.Status, mcpHealth.ConsecutiveFailures, mcpHealth.ReconnectAttempts)
+	
+	// For interactive browser tools that need element references, capture fresh snapshot first
+	// This ensures we have up-to-date page state and element references
+	if toolType == "browser" && e.needsFreshSnapshot(toolName) {
+		e.logger.Info("Capturing fresh snapshot before %s to ensure up-to-date element references", toolName)
+		snapshotArgs := map[string]interface{}{}
+		e.injectSessionID("browser_snapshot", snapshotArgs)
+		// Try different possible snapshot tool names
+		snapshotTools := []string{"browser_snapshot", "mcp_playwright_browser_snapshot"}
+		snapshotCaptured := false
+		for _, snapTool := range snapshotTools {
+			_, err := e.mcpClient.CallTool(snapTool, snapshotArgs)
+			if err == nil {
+				e.logger.Info("Fresh snapshot captured successfully before %s", toolName)
+				snapshotCaptured = true
+				break
+			}
+		}
+		if !snapshotCaptured {
+			e.logger.Warn("Failed to capture fresh snapshot before %s, proceeding anyway", toolName)
+		}
+	}
+	
 	e.logger.Tool("Executing: %s", toolName)
-	e.logger.Debug("  Arguments: %v", arguments)
-	e.logger.Debug("  Session: %s (tool: %s, state: %s)", sess.ID, toolType, sess.State)
-	e.logger.Debug("  MCP Health: %s (failures: %d)", mcpHealth.Status, mcpHealth.ConsecutiveFailures)
 
 	toolResult, err := e.mcpClient.CallTool(toolName, arguments)
+	
+	// Log MCP response
 	if err != nil {
+		e.logger.Error("MCP tool call failed - Tool: %s, Error: %v", toolName, err)
 		// Check MCP health after failure
 		mcpHealth = e.mcpClient.GetHealth()
 		
@@ -441,9 +538,22 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 		if err != nil {
 			// Error is already abstracted by MCP client, but add more context if needed
 			abstractError := err.Error()
-			e.logger.Error("  ✗ Tool execution failed")
-			e.logger.Error("    Tool: %s", toolName)
-			e.logger.Error("    Error: %s", abstractError)
+			e.logger.Error("✗ Tool execution failed")
+			e.logger.Error("Tool: %s", toolName)
+			e.logger.Error("Error: %s", abstractError)
+			
+			// Enhanced logging for browser_type failures
+			if toolName == "browser_type" || strings.Contains(toolName, "browser_type") {
+				e.logger.Error("browser_type failure details:")
+				e.logger.Error("  Session ID: %s", e.browserSessionID)
+				e.logger.Error("  Tool arguments: %v", arguments)
+				e.logger.Error("  Session state: %s", sess.State)
+				health := sess.GetHealth()
+				e.logger.Error("  Session health - SuccessRate: %.2f, ConsecutiveFailures: %d", 
+					health.SuccessRate, health.ConsecutiveFailures)
+				e.logger.Error("  MCP health - Status: %s, ConsecutiveFailures: %d", 
+					mcpHealth.Status, mcpHealth.ConsecutiveFailures)
+			}
 			
 			// Record failure in session
 			e.sessionManager.RecordFailure(sess.ID)
@@ -467,12 +577,15 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 			// Ask LLM what to do with the session
 			if e.llmCoord != nil {
 				health := sess.GetHealth()
-			contextStr := ""
-			if execCtx != nil {
-				contextStr = e.buildContextString(execCtx, rule)
-			}
-			
-			sessionAction, reasoning, err := e.llmCoord.EvaluateSessionLifecycle(
+				contextStr := ""
+				if execCtx != nil {
+					contextStr = e.buildContextString(execCtx, rule)
+				}
+				
+				e.logger.Info("Asking LLM for session lifecycle decision - ToolType: %s, Health: success_rate=%.2f, consecutive_failures=%d", 
+					toolType, health.SuccessRate, health.ConsecutiveFailures)
+				
+				sessionAction, reasoning, err := e.llmCoord.EvaluateSessionLifecycle(
 					toolType,
 					fmt.Sprintf("success_rate=%.2f, consecutive_failures=%d, total_ops=%d", 
 						health.SuccessRate, health.ConsecutiveFailures, health.TotalOperations),
@@ -490,7 +603,7 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 				)
 				if err == nil {
 					e.logger.Info("LLM session decision: %s", sessionAction)
-					e.logger.Debug("LLM reasoning: %s", reasoning)
+					e.logger.Info("LLM reasoning: %s", reasoning)
 					
 					// Execute LLM session decision
 					switch sessionAction {
@@ -509,12 +622,27 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 						}
 					case "recreate":
 						e.logger.Info("LLM decided to recreate session for %s", toolType)
-						e.sessionManager.CloseSession(sess.ID)
-						if e.db != nil {
-							e.db.CloseSession(sess.ID)
+						e.logger.Warn("Recreating session - this will create a NEW browser tab!")
+						e.logger.Info("Old session ID: %s", sess.ID)
+						
+						// For browser tools, we should NOT clear browserSessionID
+						// because we want to reuse the same session_id with the MCP server
+						// The MCP server should handle recreating the browser context for that session_id
+						if toolType != "browser" {
+							e.sessionManager.CloseSession(sess.ID)
+							if e.db != nil {
+								e.db.CloseSession(sess.ID)
+							}
+							delete(e.currentSessions, toolType)
+						} else {
+							// For browser, just mark session as recovering but keep the session_id
+							e.logger.Info("Keeping browser session ID %s - MCP server should recreate context", e.browserSessionID)
+							e.sessionManager.UpdateState(sess.ID, session.StateRecovering)
+							if e.db != nil {
+								e.db.UpdateSession(sess)
+							}
 						}
-						delete(e.currentSessions, toolType)
-						// New session will be created on next call
+						// New session will be created on next call (or reused for browser)
 					case "keep_alive":
 						fallthrough
 					default:
@@ -550,6 +678,17 @@ func (e *Executor) ExecuteSubtaskRuleWithContext(rule SubtaskRule, context strin
 			
 			return result, result.Error
 		}
+	}
+	
+	// Success - log MCP response
+	e.logger.Info("MCP tool call succeeded - Tool: %s", toolName)
+	if toolResult != nil {
+		// Log result summary (truncate if too long)
+		resultStr := string(toolResult)
+		if len(resultStr) > 200 {
+			resultStr = resultStr[:200] + "..."
+		}
+		e.logger.Info("MCP response: %s", resultStr)
 	}
 	
 	// Success - record in session
@@ -709,6 +848,28 @@ func (e *Executor) determineToolConsequence(toolName string, arguments map[strin
 	return fmt.Sprintf("Tool %s executed successfully", toolName)
 }
 
+// needsFreshSnapshot determines if a browser tool needs a fresh snapshot before execution
+// Interactive tools that use element references need fresh snapshots to ensure
+// element references are up-to-date with current page state
+func (e *Executor) needsFreshSnapshot(toolName string) bool {
+	toolNameLower := strings.ToLower(toolName)
+	// Tools that interact with elements need fresh snapshots
+	interactiveTools := []string{
+		"browser_type",
+		"browser_click",
+		"browser_fill_form",
+		"browser_select_option",
+		"browser_drag",
+		"browser_hover",
+	}
+	for _, interactiveTool := range interactiveTools {
+		if strings.Contains(toolNameLower, interactiveTool) {
+			return true
+		}
+	}
+	return false
+}
+
 // isRetryableError determines if an error is retryable
 func (e *Executor) isRetryableError(err error) bool {
 	errStr := err.Error()
@@ -855,9 +1016,12 @@ func (e *Executor) CaptureState() (string, error) {
 	e.logger.Debug("Capturing current state via MCP...")
 	
 	// Call browser_snapshot tool to get current state
-	stateData, err := e.mcpClient.CallTool("mcp_playwright_browser_snapshot", map[string]interface{}{
+	snapshotArgs := map[string]interface{}{
 		"random_string": "state_capture",
-	})
+	}
+	e.injectSessionID("mcp_playwright_browser_snapshot", snapshotArgs)
+	
+	stateData, err := e.mcpClient.CallTool("mcp_playwright_browser_snapshot", snapshotArgs)
 	if err != nil {
 		// If snapshot fails, return empty state (non-critical)
 		e.logger.Debug("Failed to capture state via MCP: %v", err)
@@ -886,9 +1050,13 @@ func (e *Executor) RestoreState(stateJSON string) error {
 	// If state contains URL, navigate back to it
 	if url, ok := stateData["url"].(string); ok && url != "" {
 		e.logger.Debug("Restoring URL via MCP: %s", url)
-		if _, err := e.mcpClient.CallTool("mcp_playwright_browser_navigate", map[string]interface{}{
+		// Create arguments map for navigation
+		navArgs := map[string]interface{}{
 			"url": url,
-		}); err != nil {
+		}
+		e.injectSessionID("mcp_playwright_browser_navigate", navArgs)
+		
+		if _, err := e.mcpClient.CallTool("mcp_playwright_browser_navigate", navArgs); err != nil {
 			return fmt.Errorf("failed to navigate to URL: %w", err)
 		}
 		e.logger.Debug("URL restored successfully")
@@ -904,6 +1072,7 @@ func (e *Executor) RestoreState(stateJSON string) error {
 // This is used when deadlock is detected due to session loss
 func (e *Executor) ReestablishBrowserSession(stateJSON string) error {
 	e.logger.Info("Attempting to re-establish browser session...")
+	e.logger.Info("Current browser session ID: %s", e.browserSessionID)
 	
 	// Try to find a URL from state snapshot or execution history
 	var targetURL string
@@ -953,11 +1122,21 @@ func (e *Executor) ReestablishBrowserSession(stateJSON string) error {
 	
 	var lastErr error
 	for _, toolName := range navigationTools {
-		_, err := e.mcpClient.CallTool(toolName, map[string]interface{}{
+		// Create arguments map for navigation
+		navArgs := map[string]interface{}{
 			"url": targetURL,
-		})
+		}
+		e.injectSessionID(toolName, navArgs)
+		
+		// Log the session_id being used for re-establishment
+		if sessionID, ok := navArgs["session_id"].(string); ok {
+			e.logger.Info("Re-establishing browser session with ID: %s, URL: %s", sessionID, targetURL)
+		}
+		
+		_, err := e.mcpClient.CallTool(toolName, navArgs)
 		if err == nil {
 			e.logger.Info("Browser session re-established successfully by navigating to %s", targetURL)
+			e.logger.Info("Session ID used: %s", e.browserSessionID)
 			// Clear error patterns since we've recovered
 			e.errorPatterns = make(map[string]int)
 			return nil

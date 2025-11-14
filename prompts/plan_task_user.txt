@@ -1,0 +1,30 @@
+Objective: %s
+
+Available Tools:
+%s
+
+Analyze this objective and create a structured plan. Break it down into executable tasks where EACH TASK USES EXACTLY ONE TOOL from the available tools list above.
+
+CRITICAL CONSIDERATIONS:
+1. Tool State Management:
+   - Think about what state each tool creates or needs
+   - Group related tools that share state (e.g., browser operations)
+   - Order tasks so state-creating tools come before state-using tools
+
+2. Tool Consequences:
+   - What happens when you call each tool?
+   - What state does it create/modify/query?
+   - How do tools depend on each other?
+
+3. Task Ordering:
+   - Order tasks logically based on state dependencies
+   - Group operations that benefit from shared state
+   - Consider tool sequences and their consequences
+
+Remember:
+- Each task must specify exactly one tool_name (must match a tool from the list above)
+- Each task must include an arguments object (can be empty {} if no arguments needed)
+- If the objective requires multiple tool calls, create multiple sequential tasks
+- Use the exact tool names as shown in the available tools list
+- Think abstractly about tool interactions and state management
+

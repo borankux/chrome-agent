@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"chrome-agent/internal/config"
 	"chrome-agent/internal/exception"
 	"chrome-agent/internal/llm"
 	"chrome-agent/internal/loop"
@@ -21,11 +22,12 @@ import (
 
 func main() {
 	var (
-		taskFile  = flag.String("task", "task.txt", "Path to task specification file")
-		mcpConfig = flag.String("mcp", "mcp-config.json", "Path to MCP configuration file")
-		dbPath    = flag.String("db", "agent.db", "Path to SQLite database file")
-		logLevel  = flag.String("log", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
-		useTUI    = flag.Bool("tui", false, "Enable TUI mode")
+		taskFile   = flag.String("task", "task.txt", "Path to task specification file")
+		mcpConfig  = flag.String("mcp", "mcp-config.json", "Path to MCP configuration file")
+		dbPath     = flag.String("db", "agent.db", "Path to SQLite database file")
+		logLevel   = flag.String("log", "INFO", "Log level: DEBUG, INFO, WARN, ERROR")
+		useTUI     = flag.Bool("tui", false, "Enable TUI mode")
+		configFile = flag.String("config", "agent-config.json", "Path to agent configuration file")
 	)
 	flag.Parse()
 
@@ -54,6 +56,7 @@ func main() {
 		logLevelEnum = logger.INFO
 	}
 	log := logger.New(logLevelEnum, "agent")
+	defer log.Close()
 	
 	// Connect logger to TUI if enabled
 	if tuiModel != nil {
@@ -63,6 +66,29 @@ func main() {
 
 	log.Info("=== Chrome Agent Starting ===")
 
+	// Load agent configuration (for proxy settings)
+	log.Debug("Loading agent configuration from: %s", *configFile)
+	agentConfig, err := config.LoadConfig(*configFile)
+	if err != nil {
+		log.Warn("Failed to load agent config (will use defaults): %v", err)
+		agentConfig = &config.Config{} // Use empty config
+	}
+	if agentConfig.HasProxy() {
+		log.Info("Proxy configuration loaded")
+		if agentConfig.Proxy.HTTPProxy != "" {
+			log.Debug("  HTTP Proxy: %s", agentConfig.Proxy.HTTPProxy)
+		}
+		if agentConfig.Proxy.HTTPSProxy != "" {
+			log.Debug("  HTTPS Proxy: %s", agentConfig.Proxy.HTTPSProxy)
+		}
+		if agentConfig.Proxy.AllProxy != "" {
+			log.Debug("  All Proxy: %s", agentConfig.Proxy.AllProxy)
+		}
+		if agentConfig.Proxy.NoProxy != "" {
+			log.Debug("  No Proxy: %s", agentConfig.Proxy.NoProxy)
+		}
+	}
+
 	// Load MCP definition
 	log.Info("Loading MCP configuration from: %s", *mcpConfig)
 	mcpDef, err := mcp.LoadDefinition(*mcpConfig)
@@ -71,15 +97,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize MCP client
-	mcpClient := mcp.NewClient(mcpDef)
+	// Initialize MCP client with proxy configuration
+	var proxyConfig *config.ProxyConfig
+	if agentConfig != nil {
+		proxyConfig = agentConfig.GetProxyConfig()
+	}
+	mcpClient := mcp.NewClient(mcpDef, proxyConfig)
 
 	// Validate MCP connection and output status report
 	log.Info("Validating MCP server connection...")
-	if mcpDef.Transport.HTTP != nil {
-		log.Info("MCP server URL: %s", mcpDef.Transport.HTTP.URL)
-		log.Debug("Connecting to HTTP MCP server...")
-	} else {
+	switch mcpDef.Transport.Type {
+	case "http", "sse":
+		if mcpDef.Transport.HTTP != nil {
+			log.Info("MCP server URL: %s", mcpDef.Transport.HTTP.URL)
+			log.Debug("Connecting to HTTP MCP server...")
+		} else if mcpDef.Transport.SSE != nil {
+			log.Info("MCP server SSE URL: %s", mcpDef.Transport.SSE.URL)
+			log.Debug("Connecting to SSE MCP server...")
+		}
+	case "stdio":
+		log.Info("MCP transport: stdio")
+		if len(mcpDef.Transport.Command) > 0 {
+			log.Debug("MCP command: %s", strings.Join(mcpDef.Transport.Command, " "))
+		}
+	default:
 		log.Debug("MCP transport type: %s", mcpDef.Transport.Type)
 	}
 
@@ -105,9 +146,26 @@ func main() {
 	case <-time.After(15 * time.Second):
 		log.Error("MCP server validation timed out after 15 seconds")
 		log.Error("Please check:")
-		log.Error("  1. Is the MCP server running at %s?", mcpDef.Transport.HTTP.URL)
-		log.Error("  2. Is the server accessible?")
-		log.Error("  3. Check server logs for errors")
+		switch mcpDef.Transport.Type {
+		case "http", "sse":
+			if mcpDef.Transport.HTTP != nil {
+				log.Error("  1. Is the MCP server running at %s?", mcpDef.Transport.HTTP.URL)
+			} else if mcpDef.Transport.SSE != nil {
+				log.Error("  1. Is the MCP server running at %s?", mcpDef.Transport.SSE.URL)
+			}
+			log.Error("  2. Is the server accessible?")
+			log.Error("  3. Check server logs for errors")
+		case "stdio":
+			log.Error("  1. Is the MCP server command available?")
+			if len(mcpDef.Transport.Command) > 0 {
+				log.Error("  2. Command: %s", strings.Join(mcpDef.Transport.Command, " "))
+			}
+			log.Error("  3. Check if the command can be executed")
+			log.Error("  4. Check server logs/stderr for errors")
+		default:
+			log.Error("  1. Check MCP server configuration")
+			log.Error("  2. Verify transport type: %s", mcpDef.Transport.Type)
+		}
 		os.Exit(1)
 	}
 
@@ -145,13 +203,42 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load and parse task (with LLM planning if needed)
+	// Load and parse task (always uses LLM planning)
 	log.Info("Loading task from: %s", *taskFile)
-	taskSpec, err := task.ParseTaskOrPlan(*taskFile, llmCoord, mcpClient, log)
+	
+	// Read raw input for failure tracking (use entire content or first line as fallback)
+	rawData, readErr := os.ReadFile(*taskFile)
+	var objective string
+	if readErr == nil {
+		objective = strings.TrimSpace(string(rawData))
+		if objective == "" {
+			objective = "Unknown task"
+		}
+	} else {
+		objective = "Unknown task"
+	}
+	
+	parseResult, err := task.ParseTaskOrPlanWithTodos(*taskFile, llmCoord, mcpClient, log)
 	if err != nil {
 		log.Error("Failed to parse or plan task: %v", err)
+		
+		// Create a task record to mark it as failed
+		taskID, createErr := db.CreateTask(objective)
+		if createErr == nil {
+			if updateErr := db.UpdateTaskStatusWithReason(taskID, state.TaskStatusFailed, err.Error()); updateErr != nil {
+				log.Error("Failed to update task status: %v", updateErr)
+			} else {
+				log.Info("Task marked as failed in database (ID: %d)", taskID)
+			}
+		} else {
+			log.Error("Failed to create task record: %v", createErr)
+		}
+		
 		os.Exit(1)
 	}
+
+	taskSpec := parseResult.Spec
+	todos := parseResult.Todos
 
 	log.Info("Task objective: %s", taskSpec.Objective)
 	if taskSpec.LoopCondition != nil {
@@ -160,6 +247,47 @@ func main() {
 	log.Info("Number of subtasks: %d", len(taskSpec.SubtaskRules))
 	if len(taskSpec.ExceptionRules) > 0 {
 		log.Info("Exception rules: %d", len(taskSpec.ExceptionRules))
+	}
+
+	// Convert PlanTodo to tui.TodoItem and send to TUI
+	if tuiModel != nil && len(todos) > 0 {
+		tuiTodos := make([]*tui.TodoItem, len(todos))
+		for i, todo := range todos {
+			tuiTodos[i] = &tui.TodoItem{
+				ID:          todo.ID,
+				Name:        todo.Name,
+				Description: todo.Description,
+				Status:      todo.Status,
+				ToolName:    todo.ToolName,
+			}
+		}
+		tuiModel.SendUpdate(tui.TodoUpdateMsg{Todos: tuiTodos})
+	}
+
+	// Log todos without color
+	if len(todos) > 0 {
+		log.Info("=== Todo List ===")
+		for i, todo := range todos {
+			var statusIcon string
+			switch todo.Status {
+			case "pending":
+				statusIcon = "[ ]"
+			case "in_progress":
+				statusIcon = "[→]"
+			case "completed":
+				statusIcon = "[✓]"
+			case "failed":
+				statusIcon = "[✗]"
+			default:
+				statusIcon = "[ ]"
+			}
+			toolInfo := ""
+			if todo.ToolName != "" {
+				toolInfo = fmt.Sprintf(" (%s)", todo.ToolName)
+			}
+			log.Info("  %s %d. %s%s", statusIcon, i+1, todo.Name, toolInfo)
+		}
+		log.Info("=================")
 	}
 
 	// Create task manager
@@ -175,6 +303,21 @@ func main() {
 	// Load active sessions from database
 	if err := executor.LoadSessions(); err != nil {
 		log.Warn("Failed to load sessions: %v", err)
+	}
+
+	// Store todos for status updates during execution
+	var currentTodos []*tui.TodoItem
+	if len(todos) > 0 {
+		currentTodos = make([]*tui.TodoItem, len(todos))
+		for i, todo := range todos {
+			currentTodos[i] = &tui.TodoItem{
+				ID:          todo.ID,
+				Name:        todo.Name,
+				Description: todo.Description,
+				Status:      todo.Status,
+				ToolName:    todo.ToolName,
+			}
+		}
 	}
 
 	// Create exception handler
@@ -244,7 +387,7 @@ func main() {
 		execErr = loopManager.ExecuteLoop()
 	} else {
 		log.Info("Executing single task...")
-		execErr = executeSingleTask(taskManager, executor, exceptionHandler, log, tuiModel)
+		execErr = executeSingleTask(taskManager, executor, exceptionHandler, log, tuiModel, currentTodos)
 	}
 	
 	// Update TUI with final status
@@ -375,7 +518,18 @@ func printTokenStatistics(llmCoord *llm.Coordinator, log *logger.Logger) *tui.St
 	}
 }
 
-func executeSingleTask(taskManager *task.Manager, executor *task.Executor, exceptionHandler *exception.Handler, log *logger.Logger, tuiModel *tui.Model) error {
+// updateTodoStatus updates a todo item status and sends update to TUI
+func updateTodoStatus(todos []*tui.TodoItem, subtaskIndex int, status string, tuiModel *tui.Model) {
+	if todos == nil || subtaskIndex < 0 || subtaskIndex >= len(todos) {
+		return
+	}
+	todos[subtaskIndex].Status = status
+	if tuiModel != nil {
+		tuiModel.SendUpdate(tui.TodoUpdateMsg{Todos: todos})
+	}
+}
+
+func executeSingleTask(taskManager *task.Manager, executor *task.Executor, exceptionHandler *exception.Handler, log *logger.Logger, tuiModel *tui.Model, todos []*tui.TodoItem) error {
 	spec := taskManager.GetSpec()
 
 	// Build execution context
@@ -384,7 +538,7 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 		Objective:   spec.Objective,
 	}
 
-	for _, rule := range spec.SubtaskRules {
+	for subtaskIndex, rule := range spec.SubtaskRules {
 		subtaskID, err := taskManager.CreateSubtask(rule.Name, 0)
 		if err != nil {
 			return fmt.Errorf("failed to create subtask: %w", err)
@@ -393,6 +547,9 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 		if err := taskManager.UpdateSubtaskStatus(subtaskID, state.SubtaskStatusInProgress); err != nil {
 			return fmt.Errorf("failed to update subtask status: %w", err)
 		}
+
+		// Update todo status to in_progress
+		updateTodoStatus(todos, subtaskIndex, "in_progress", tuiModel)
 
 		// Update context with current subtask
 		execCtx.SubtaskName = rule.Name
@@ -431,6 +588,8 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 				if err := taskManager.UpdateSubtaskStatus(subtaskID, state.SubtaskStatusFailed); err != nil {
 					return fmt.Errorf("failed to update subtask status: %w", err)
 				}
+				// Update todo status to failed
+				updateTodoStatus(todos, subtaskIndex, "failed", tuiModel)
 				return fmt.Errorf("non-retryable failure: %w", execErr)
 			}
 
@@ -603,6 +762,8 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 				if err := taskManager.UpdateSubtaskStatus(subtaskID, state.SubtaskStatusFailed); err != nil {
 					return fmt.Errorf("failed to update subtask status: %w", err)
 				}
+				// Update todo status to failed
+				updateTodoStatus(todos, subtaskIndex, "failed", tuiModel)
 				// Continue to next subtask
 				break
 			}
@@ -638,6 +799,8 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 			if err := taskManager.UpdateSubtaskStatus(subtaskID, state.SubtaskStatusFailed); err != nil {
 				return fmt.Errorf("failed to update subtask status: %w", err)
 			}
+			// Update todo status to failed
+			updateTodoStatus(todos, subtaskIndex, "failed", tuiModel)
 			continue
 		}
 
@@ -648,6 +811,9 @@ func executeSingleTask(taskManager *task.Manager, executor *task.Executor, excep
 		if err := taskManager.UpdateSubtaskResult(subtaskID, result); err != nil {
 			return fmt.Errorf("failed to update subtask result: %w", err)
 		}
+
+		// Update todo status to completed
+		updateTodoStatus(todos, subtaskIndex, "completed", tuiModel)
 
 		log.Info("Subtask '%s' completed successfully", rule.Name)
 	}

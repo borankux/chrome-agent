@@ -1,0 +1,14 @@
+Task: %s
+
+Available Tools:
+%s
+
+Analyze this task considering:
+1. What tools were called before (if any) and what state they created
+2. Whether you should reuse existing tool state or create new state
+3. The consequences of calling each tool - what does it do? What state does it create/modify?
+4. Tool dependencies - which tools need other tools to run first?
+5. State management - how should tool state be maintained across calls?
+
+Think abstractly about tool interactions and their consequences.
+

@@ -1,0 +1,19 @@
+Retry limit exceeded - decide next action:
+
+Subtask: %s
+Tool: %s
+Error: %s
+Retries: %d/%d
+Objective: %s
+
+Execution Context:
+%s
+
+What should we do?
+- Skip this subtask if it's not critical?
+- End cycle if this subtask is blocking?
+- End task if objective cannot be achieved?
+- Recover state if tool state was lost?
+- Adjust approach if a different method might work?
+- Keep session alive and retry if session is healthy and error might be transient?
+

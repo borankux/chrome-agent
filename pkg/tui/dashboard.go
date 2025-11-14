@@ -12,6 +12,7 @@ type Model struct {
 	header    HeaderModel
 	progress  ProgressModel
 	execution ExecutionModel
+	todos     TodoModel
 	logs      LogsModel
 	stats     StatsModel
 	errors    ErrorModel
@@ -35,6 +36,7 @@ func NewModel() *Model {
 		header:    NewHeaderModel(),
 		progress:  NewProgressModel(),
 		execution: NewExecutionModel(),
+		todos:     NewTodoModel(),
 		logs:      NewLogsModel(),
 		stats:     NewStatsModel(),
 		errors:    NewErrorModel(),
@@ -68,6 +70,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.header, _ = m.header.Update(resizeMsg)
 		m.progress, _ = m.progress.Update(resizeMsg)
 		m.execution, _ = m.execution.Update(resizeMsg)
+		m.todos, _ = m.todos.Update(resizeMsg)
 		m.stats, _ = m.stats.Update(resizeMsg)
 		m.logs, _ = m.logs.Update(resizeMsg)
 		m.errors, _ = m.errors.Update(resizeMsg)
@@ -124,6 +127,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.stats, _ = m.stats.Update(msg)
 		return m, nil
 		
+	case TodoUpdateMsg:
+		m.todos, _ = m.todos.Update(msg)
+		return m, nil
+		
 	case ErrorMsg:
 		m.errors, _ = m.errors.Update(msg)
 		return m, nil
@@ -155,20 +162,46 @@ func (m Model) View() string {
 	headerHeight := 1
 	progressHeight := 1
 	executionHeight := 4
+	todosHeight := 8 // Default height for todos
 	statsHeight := 1
-	logsHeight := m.height - headerHeight - progressHeight - executionHeight - statsHeight - 2
+	// Adjust todos height based on number of todos
+	todosCount := m.todos.Count()
+	if todosCount > 0 {
+		// Calculate needed height: header + todos + border
+		neededHeight := 2 + todosCount
+		if neededHeight > 12 {
+			todosHeight = 12 // Max height
+		} else if neededHeight < 4 {
+			todosHeight = 4 // Min height
+		} else {
+			todosHeight = neededHeight
+		}
+	} else {
+		todosHeight = 0
+	}
+	
+	logsHeight := m.height - headerHeight - progressHeight - executionHeight - todosHeight - statsHeight - 2
 	
 	if logsHeight < 5 {
 		logsHeight = 5
+		// Reduce todos height if logs need more space
+		if todosHeight > 4 {
+			todosHeight = m.height - headerHeight - progressHeight - executionHeight - logsHeight - statsHeight - 2
+			if todosHeight < 4 {
+				todosHeight = 4
+			}
+		}
 	}
 	
-	// Update logs height
+	// Update component heights
 	m.logs.height = logsHeight
+	m.todos.height = todosHeight
 	
 	// Build view
 	header := m.header.View()
 	progress := m.progress.View()
 	execution := m.execution.View()
+	todosView := m.todos.View()
 	logs := m.logs.View()
 	stats := m.stats.View()
 	errorsView := m.errors.View()
@@ -180,6 +213,9 @@ func (m Model) View() string {
 	}
 	if execution != "" {
 		panels = append(panels, execution)
+	}
+	if todosView != "" {
+		panels = append(panels, todosView)
 	}
 	if errorsView != "" {
 		panels = append(panels, errorsView)

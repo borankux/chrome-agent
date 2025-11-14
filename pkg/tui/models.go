@@ -89,5 +89,23 @@ type (
 		Width  int
 		Height int
 	}
+	
+	TodoUpdateMsg struct {
+		Todos []*TodoItem
+	}
 )
+
+// TodoItem represents a single todo item
+type TodoItem struct {
+	ID          int
+	Name        string
+	Description string
+	Status      string // "pending", "in_progress", "completed", "failed"
+	ToolName    string
+}
+
+// TodoList represents a collection of todos
+type TodoList struct {
+	Items []*TodoItem
+}
 

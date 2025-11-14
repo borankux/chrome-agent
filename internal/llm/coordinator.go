@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +20,115 @@ type TokenUsage struct {
 	CompletionTokens int
 	TotalTokens      int
 	CallType         string // "planning", "reasoning", etc.
+}
+
+// loadPrompt loads a prompt from a file in the prompts/ directory
+func loadPrompt(filename string) (string, error) {
+	// Get the project root directory (assuming we're in internal/llm/)
+	// Try to find prompts directory relative to current working directory
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get working directory: %w", err)
+	}
+
+	// Try multiple possible locations for prompts directory
+	possiblePaths := []string{
+		filepath.Join(wd, "prompts", filename),
+		filepath.Join(wd, "..", "prompts", filename),
+		filepath.Join(wd, "..", "..", "prompts", filename),
+		filepath.Join(wd, "..", "..", "..", "prompts", filename),
+	}
+
+	var promptPath string
+	for _, path := range possiblePaths {
+		if _, err := os.Stat(path); err == nil {
+			promptPath = path
+			break
+		}
+	}
+
+	if promptPath == "" {
+		return "", fmt.Errorf("prompt file not found: %s (searched in: %v)", filename, possiblePaths)
+	}
+
+	content, err := os.ReadFile(promptPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read prompt file %s: %w", filename, err)
+	}
+
+	return string(content), nil
+}
+
+// validatePrompt validates a prompt for formatting requirements and placeholder integrity
+func validatePrompt(prompt string, promptName string, hasPlaceholders bool) error {
+	// Check prompt is non-empty
+	if len(strings.TrimSpace(prompt)) == 0 {
+		return fmt.Errorf("prompt validation failed for %s: prompt is empty", promptName)
+	}
+
+	// Check minimum length
+	if len(prompt) < 10 {
+		return fmt.Errorf("prompt validation failed for %s: prompt too short (minimum 10 characters)", promptName)
+	}
+
+	// Check maximum length (100KB)
+	const maxPromptSize = 100 * 1024
+	if len(prompt) > maxPromptSize {
+		return fmt.Errorf("prompt validation failed for %s: prompt too long (maximum %d bytes)", promptName, maxPromptSize)
+	}
+
+	// Validate placeholders if needed
+	if hasPlaceholders {
+		if err := validatePlaceholders(prompt, promptName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validatePlaceholders validates fmt.Sprintf placeholders in a prompt
+func validatePlaceholders(prompt string, promptName string) error {
+	// Pattern to match valid fmt.Sprintf format specifiers
+	// Matches: %[flags][width][.precision]verb
+	// Valid verbs: v, s, d, b, o, x, X, f, F, e, E, g, G, c, q, p, t, T, U
+	// Also handles %% for literal percent sign
+	validVerbPattern := regexp.MustCompile(`%%|%[+\-#0 ]?[0-9]*(\.[0-9]+)?[vTtbcdoqxXfFeEgGspU]`)
+
+	// Find all % signs
+	percentIndexes := []int{}
+	for i, r := range prompt {
+		if r == '%' {
+			percentIndexes = append(percentIndexes, i)
+		}
+	}
+
+	// Check each % sign
+	for _, idx := range percentIndexes {
+		// Get the remaining string from this position
+		remaining := prompt[idx:]
+
+		// Check if this % starts a valid format specifier
+		matched := validVerbPattern.FindStringIndex(remaining)
+		if matched == nil || matched[0] != 0 {
+			// Find the next space, newline, or end of string to show context
+			contextEnd := idx + 20
+			if contextEnd > len(prompt) {
+				contextEnd = len(prompt)
+			}
+			context := prompt[idx:contextEnd]
+			return fmt.Errorf("prompt validation failed for %s: broken or invalid fmt.Sprintf placeholder at position %d: %q (valid format: %%[flags][width][.precision]verb)", promptName, idx, context)
+		}
+	}
+
+	// Check for unmatched braces (if used)
+	openBraces := strings.Count(prompt, "{")
+	closeBraces := strings.Count(prompt, "}")
+	if openBraces != closeBraces {
+		return fmt.Errorf("prompt validation failed for %s: unmatched braces (open: %d, close: %d)", promptName, openBraces, closeBraces)
+	}
+
+	return nil
 }
 
 // Coordinator handles LLM reasoning and tool coordination
@@ -141,53 +252,28 @@ func (c *Coordinator) ReasonAboutTask(taskDescription string, availableTools []i
 
 // ReasonAboutTaskWithContext uses LLM to reason about a task with full execution context
 func (c *Coordinator) ReasonAboutTaskWithContext(taskDescription string, availableTools []interface{}, execCtx interface{}) (*ReasoningResult, error) {
-	systemPrompt := `You are an intelligent agent coordinator that helps execute tasks using tools that interact with external systems.
-
-CRITICAL UNDERSTANDING:
-- Tools interact with external systems (browsers, APIs, databases, etc.) that maintain STATE
-- When you call a tool, it may CREATE, MODIFY, or QUERY state in an external system
-- Related tool calls often benefit from SHARING STATE (e.g., browser session, API connection)
-- Tool state can be LOST if not maintained properly (sessions expire, connections close)
-- You must reason about tool CONSEQUENCES and STATE DEPENDENCIES
-
-Your job is to:
-1. Understand the task description and current execution context
-2. Analyze what tools were called before and what state they created
-3. Determine if you should REUSE existing tool state or CREATE new state
-4. Select the appropriate tool(s) considering state management
-5. Think about tool CONSEQUENCES - what happens when this tool is called?
-6. Consider tool SEQUENCES - which tools depend on others?
-
-TOOL STATE MANAGEMENT:
-- If previous tools created state (e.g., opened browser, logged in), consider reusing it
-- If tool state was lost (errors indicate state not found), you may need to re-establish state
-- Group related operations that benefit from shared state
-- Think abstractly: "What state does this tool need? Does it exist? Should I create it?"
-
-Respond in JSON format with:
-- reasoning: Your thought process including state management considerations
-- tool_calls: Array of tool calls to make (each with name, arguments, reasoning)
-- next_step: What should happen after these tool calls
-- confidence: Your confidence level (0.0 to 1.0)`
+	systemPrompt, err := loadPrompt("reason_about_task_system.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load system prompt: %w", err)
+	}
+	if err := validatePrompt(systemPrompt, "reason_about_task_system.txt", false); err != nil {
+		return nil, fmt.Errorf("system prompt validation failed: %w", err)
+	}
 
 	toolsJSON, err := json.MarshalIndent(availableTools, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal tools: %w", err)
 	}
 
-	userPrompt := fmt.Sprintf(`Task: %s
+	userPromptTemplate, err := loadPrompt("reason_about_task_user.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load user prompt: %w", err)
+	}
+	if err := validatePrompt(userPromptTemplate, "reason_about_task_user.txt", true); err != nil {
+		return nil, fmt.Errorf("user prompt validation failed: %w", err)
+	}
 
-Available Tools:
-%s
-
-Analyze this task considering:
-1. What tools were called before (if any) and what state they created
-2. Whether you should reuse existing tool state or create new state
-3. The consequences of calling each tool - what does it do? What state does it create/modify?
-4. Tool dependencies - which tools need other tools to run first?
-5. State management - how should tool state be maintained across calls?
-
-Think abstractly about tool interactions and their consequences.`, taskDescription, string(toolsJSON))
+	userPrompt := fmt.Sprintf(userPromptTemplate, taskDescription, string(toolsJSON))
 
 	// Build function definitions for OpenAI
 	toolDefs := BuildToolDefinitions(availableTools)
@@ -214,7 +300,7 @@ Think abstractly about tool interactions and their consequences.`, taskDescripti
 	}
 
 	ctx := context.Background()
-	resp, err := c.client.CreateChatCompletion(ctx, req)
+	resp, err := c.callWithRetry(ctx, req, 3)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call OpenAI API: %w", err)
 	}
@@ -287,7 +373,7 @@ func (c *Coordinator) ReasonAboutSubtaskWithContext(subtaskDescription string, c
 		SubtaskName       string
 		Objective         string
 	}
-	
+
 	// Build enhanced context with execution history
 	var enhancedContext strings.Builder
 	enhancedContext.WriteString(context)
@@ -298,7 +384,12 @@ func (c *Coordinator) ReasonAboutSubtaskWithContext(subtaskDescription string, c
 	enhancedContext.WriteString("- Whether tool state needs to be maintained or re-established\n")
 	enhancedContext.WriteString("- How this tool call relates to previous tool calls\n")
 	enhancedContext.WriteString("- Whether related tools should reuse existing state\n")
-	
+	enhancedContext.WriteString("\nSESSION PERSISTENCE:\n")
+	enhancedContext.WriteString("- Browser tools automatically share the same browser session across all calls\n")
+	enhancedContext.WriteString("- Browser state (tabs, cookies, navigation) persists between tool calls\n")
+	enhancedContext.WriteString("- You don't need to pass session_id - it's handled automatically\n")
+	enhancedContext.WriteString("- This means if you navigated to a page earlier, subsequent browser tools can interact with that same page\n")
+
 	fullDescription := fmt.Sprintf(`Subtask: %s
 
 %s`, subtaskDescription, enhancedContext.String())
@@ -314,6 +405,25 @@ func (c *Coordinator) GetContext() []openai.ChatCompletionMessage {
 // Reset clears the conversation history
 func (c *Coordinator) Reset() {
 	c.messages = make([]openai.ChatCompletionMessage, 0)
+}
+
+// callWithRetry wraps CreateChatCompletion with retry logic
+// Retries up to maxRetries times with exponential backoff
+func (c *Coordinator) callWithRetry(ctx context.Context, req openai.ChatCompletionRequest, maxRetries int) (*openai.ChatCompletionResponse, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 1s, 2s, 4s
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			time.Sleep(backoff)
+		}
+		resp, err := c.client.CreateChatCompletion(ctx, req)
+		if err == nil {
+			return &resp, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("LLM call failed after %d retries: %w", maxRetries, lastErr)
 }
 
 // recordTokenUsage records token usage from an OpenAI response
@@ -361,114 +471,28 @@ func (c *Coordinator) GetTokenStatistics() (totalPrompt, totalCompletion, totalT
 // PlanTask uses LLM to plan a task from a free-form objective
 // Returns JSON string with structured plan
 func (c *Coordinator) PlanTask(objective string, availableTools []interface{}) (string, error) {
-	systemPrompt := `You are an intelligent task planning agent that breaks down high-level objectives into structured, executable tasks.
-
-CRITICAL RULE: Each task must use exactly ONE MCP tool call. If a task requires multiple tools, break it into multiple sequential tasks.
-
-UNDERSTANDING TOOL INTERACTIONS:
-- Tools interact with external systems (browsers, APIs, databases, etc.) that maintain STATE
-- When tools are called, they CREATE, MODIFY, or QUERY state in external systems
-- Related tool calls often benefit from SHARING STATE (e.g., browser sessions, API connections)
-- Think about tool CONSEQUENCES: What happens when this tool is called? What state does it create?
-- Consider tool SEQUENCES: Which tools depend on others? Which tools create state that others need?
-- Group related operations that benefit from shared state together in the plan
-
-Your job is to:
-1. Analyze the objective and understand what needs to be accomplished
-2. Break it down into logical subtasks - each subtask uses exactly ONE tool from the available tools
-3. Think about tool CONSEQUENCES and STATE DEPENDENCIES when ordering tasks
-4. Group related tool calls that benefit from shared state (e.g., browser operations)
-5. Identify if the task requires looping (time-based or quota-based)
-6. Suggest exception handling rules for common failure scenarios
-7. For each task, specify the exact tool name and arguments needed
-
-You MUST respond with valid JSON in the following schema:
-{
-  "objective": "string - the main objective",
-  "loop_condition": {
-    "type": "time|quota|null - null if no loop needed",
-    "target_value": number - duration in seconds for time, count for quota,
-    "description": "string - human-readable description"
-  },
-  "tasks": [
-    {
-      "name": "string - short task name",
-      "description": "string - detailed description of what this task does",
-      "tool_name": "string - REQUIRED: the exact name of the MCP tool to call (must match available tools)",
-      "arguments": { "key": "value" } - REQUIRED: arguments object for the tool call (can be empty {}),
-      "steps": ["string"] - optional array of step descriptions,
-      "requires_loop": boolean - whether this task should be repeated
-    }
-  ],
-  "exception_rules": [
-    {
-      "pattern": "string - error pattern to match",
-      "requires_intervention": boolean - whether human intervention needed,
-      "retryable": boolean - whether this can be retried,
-      "max_retries": number - maximum retry attempts
-    }
-  ]
-}
-
-Examples:
-- For "search for 10 movie stars": 
-  - loop_condition.type = "quota", target_value = 10
-  - Each task should use one tool (e.g., browser_navigate, browser_click, etc.)
-  - Group browser operations together - they share browser state
-- For "run for 1 hour": 
-  - loop_condition.type = "time", target_value = 3600
-- For "open Google and search": 
-  - Task 1: tool_name = "mcp_playwright_browser_navigate", arguments = {"url": "https://google.com"}
-    (This creates browser state - subsequent browser tools can reuse it)
-  - Task 2: tool_name = "mcp_playwright_browser_fill", arguments = {"selector": "input[name='q']", "text": "search term"}
-    (This uses the browser state created by Task 1)
-
-TOOL STATE THINKING:
-- When planning, think: "What state does this tool create? Do later tools need that state?"
-- Group tools that share state together (e.g., all browser operations in sequence)
-- Consider tool consequences: navigation creates browser state, clicking uses browser state, etc.
-- Order tasks so state-creating tools come before state-using tools
-
-IMPORTANT: 
-- Each task MUST have exactly one tool_name from the available tools list
-- If a high-level action needs multiple tools, create multiple tasks
-- Think about tool state and consequences when ordering tasks
-- Return ONLY valid JSON, no markdown formatting, no code blocks.`
+	systemPrompt, err := loadPrompt("plan_task_system.txt")
+	if err != nil {
+		return "", fmt.Errorf("failed to load system prompt: %w", err)
+	}
+	if err := validatePrompt(systemPrompt, "plan_task_system.txt", false); err != nil {
+		return "", fmt.Errorf("system prompt validation failed: %w", err)
+	}
 
 	toolsJSON, err := json.MarshalIndent(availableTools, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal tools: %w", err)
 	}
 
-	userPrompt := fmt.Sprintf(`Objective: %s
+	userPromptTemplate, err := loadPrompt("plan_task_user.txt")
+	if err != nil {
+		return "", fmt.Errorf("failed to load user prompt: %w", err)
+	}
+	if err := validatePrompt(userPromptTemplate, "plan_task_user.txt", true); err != nil {
+		return "", fmt.Errorf("user prompt validation failed: %w", err)
+	}
 
-Available Tools:
-%s
-
-Analyze this objective and create a structured plan. Break it down into executable tasks where EACH TASK USES EXACTLY ONE TOOL from the available tools list above.
-
-CRITICAL CONSIDERATIONS:
-1. Tool State Management:
-   - Think about what state each tool creates or needs
-   - Group related tools that share state (e.g., browser operations)
-   - Order tasks so state-creating tools come before state-using tools
-
-2. Tool Consequences:
-   - What happens when you call each tool?
-   - What state does it create/modify/query?
-   - How do tools depend on each other?
-
-3. Task Ordering:
-   - Order tasks logically based on state dependencies
-   - Group operations that benefit from shared state
-   - Consider tool sequences and their consequences
-
-Remember:
-- Each task must specify exactly one tool_name (must match a tool from the list above)
-- Each task must include an arguments object (can be empty {} if no arguments needed)
-- If the objective requires multiple tool calls, create multiple sequential tasks
-- Use the exact tool names as shown in the available tools list
-- Think abstractly about tool interactions and state management`, objective, string(toolsJSON))
+	userPrompt := fmt.Sprintf(userPromptTemplate, objective, string(toolsJSON))
 
 	messages := append([]openai.ChatCompletionMessage{}, c.messages...)
 	messages = append(messages, openai.ChatCompletionMessage{
@@ -490,7 +514,7 @@ Remember:
 	}
 
 	ctx := context.Background()
-	resp, err := c.client.CreateChatCompletion(ctx, req)
+	resp, err := c.callWithRetry(ctx, req, 3)
 	if err != nil {
 		return "", fmt.Errorf("failed to call OpenAI API: %w", err)
 	}
@@ -505,7 +529,7 @@ Remember:
 	}
 
 	content := resp.Choices[0].Message.Content
-	
+
 	// Clean up the content - remove markdown code blocks if present
 	content = strings.TrimSpace(content)
 	if strings.HasPrefix(content, "```json") {
@@ -529,60 +553,38 @@ Remember:
 
 // EvaluateLoopCompletion evaluates whether a loop should continue or complete using LLM
 func (c *Coordinator) EvaluateLoopCompletion(executionContext string, loopType string, progress float64, target float64, cycleNumber int, objective string) (bool, string, error) {
-	systemPrompt := `You are an intelligent loop completion evaluator. Your job is to determine if a loop should continue or complete based on execution context and progress.
+	systemPrompt, err := loadPrompt("evaluate_loop_completion_system.txt")
+	if err != nil {
+		return false, "", fmt.Errorf("failed to load system prompt: %w", err)
+	}
+	if err := validatePrompt(systemPrompt, "evaluate_loop_completion_system.txt", false); err != nil {
+		return false, "", fmt.Errorf("system prompt validation failed: %w", err)
+	}
 
-CRITICAL UNDERSTANDING:
-- Loops can complete EARLY if the objective is achieved before reaching the target
-- Loops should CONTINUE if progress is being made toward the objective
-- Loops should COMPLETE if the objective is clearly achieved or if continuing would be wasteful
-- Consider both mechanical progress (time/quota) AND actual objective achievement
+	userPromptTemplate, err := loadPrompt("evaluate_loop_completion_user.txt")
+	if err != nil {
+		return false, "", fmt.Errorf("failed to load user prompt: %w", err)
+	}
+	if err := validatePrompt(userPromptTemplate, "evaluate_loop_completion_user.txt", true); err != nil {
+		return false, "", fmt.Errorf("user prompt validation failed: %w", err)
+	}
 
-You must respond with valid JSON:
-{
-  "should_complete": boolean - true if loop should complete, false if should continue,
-  "reasoning": "string - detailed explanation of your decision",
-  "objective_achieved": boolean - whether the actual objective has been achieved,
-  "confidence": number - confidence level 0.0 to 1.0
-}`
-
-	userPrompt := fmt.Sprintf(`Evaluate loop completion:
-
-Objective: %s
-Loop Type: %s
-Current Progress: %.2f
-Target: %.2f
-Cycle Number: %d
-
-Execution Context:
-%s
-
-Based on this information, determine:
-1. Has the objective been achieved? (even if progress < target)
-2. Should the loop continue or complete?
-3. What is your reasoning?
-
-Consider:
-- If objective is achieved early, complete the loop
-- If making good progress toward objective, continue
-- If stuck or making no progress, consider completing
-- Balance between efficiency and thoroughness`, objective, loopType, progress, target, cycleNumber, executionContext)
+	userPrompt := fmt.Sprintf(userPromptTemplate, objective, loopType, progress, target, cycleNumber, executionContext)
 
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
 
-	resp, err := c.client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model:       c.model,
-			Messages:    messages,
-			Temperature: 0.3, // Lower temperature for more consistent decisions
-			ResponseFormat: &openai.ChatCompletionResponseFormat{
-				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-			},
+	req := openai.ChatCompletionRequest{
+		Model:       c.model,
+		Messages:    messages,
+		Temperature: 0.3, // Lower temperature for more consistent decisions
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
 		},
-	)
+	}
+	resp, err := c.callWithRetry(context.Background(), req, 3)
 	if err != nil {
 		return false, "", fmt.Errorf("LLM evaluation failed: %w", err)
 	}
@@ -619,58 +621,38 @@ Consider:
 
 // EvaluateRetryExhaustion evaluates what to do when retries are exhausted
 func (c *Coordinator) EvaluateRetryExhaustion(subtaskName string, toolName string, errorMessage string, retryCount int, maxRetries int, executionContext string, objective string) (string, string, error) {
-	systemPrompt := `You are an intelligent error recovery coordinator. When retry limits are exceeded, you must decide the best course of action.
+	systemPrompt, err := loadPrompt("evaluate_retry_exhaustion_system.txt")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load system prompt: %w", err)
+	}
+	if err := validatePrompt(systemPrompt, "evaluate_retry_exhaustion_system.txt", false); err != nil {
+		return "", "", fmt.Errorf("system prompt validation failed: %w", err)
+	}
 
-Available actions:
-- "skip": Skip this subtask and continue to next
-- "end_cycle": End current cycle and move to next cycle
-- "end_task": End the entire task
-- "recover_state": Attempt to recover tool state and retry
-- "adjust_approach": Suggest a different approach for this subtask
-- "keep_session": Keep the session alive and retry (preserve session state - sessions are valuable)
+	userPromptTemplate, err := loadPrompt("evaluate_retry_exhaustion_user.txt")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load user prompt: %w", err)
+	}
+	if err := validatePrompt(userPromptTemplate, "evaluate_retry_exhaustion_user.txt", true); err != nil {
+		return "", "", fmt.Errorf("user prompt validation failed: %w", err)
+	}
 
-You must respond with valid JSON:
-{
-  "action": "string - one of: skip, end_cycle, end_task, recover_state, adjust_approach, keep_session",
-  "reasoning": "string - detailed explanation",
-  "suggestion": "string - optional suggestion for recovery or adjustment"
-}`
-
-	userPrompt := fmt.Sprintf(`Retry limit exceeded - decide next action:
-
-Subtask: %s
-Tool: %s
-Error: %s
-Retries: %d/%d
-Objective: %s
-
-Execution Context:
-%s
-
-What should we do?
-- Skip this subtask if it's not critical?
-- End cycle if this subtask is blocking?
-- End task if objective cannot be achieved?
-- Recover state if tool state was lost?
-- Adjust approach if a different method might work?
-- Keep session alive and retry if session is healthy and error might be transient?`, subtaskName, toolName, errorMessage, retryCount, maxRetries, objective, executionContext)
+	userPrompt := fmt.Sprintf(userPromptTemplate, subtaskName, toolName, errorMessage, retryCount, maxRetries, objective, executionContext)
 
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
 
-	resp, err := c.client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model:       c.model,
-			Messages:    messages,
-			Temperature: 0.5,
-			ResponseFormat: &openai.ChatCompletionResponseFormat{
-				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-			},
+	req := openai.ChatCompletionRequest{
+		Model:       c.model,
+		Messages:    messages,
+		Temperature: 0.5,
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
 		},
-	)
+	}
+	resp, err := c.callWithRetry(context.Background(), req, 3)
 	if err != nil {
 		return "skip", "", fmt.Errorf("LLM evaluation failed: %w", err)
 	}
@@ -706,57 +688,38 @@ What should we do?
 
 // EvaluateDeadlock evaluates what to do when a deadlock is detected
 func (c *Coordinator) EvaluateDeadlock(subtaskName string, toolName string, errorMessage string, consecutiveFailures int, executionContext string, objective string) (string, string, error) {
-	systemPrompt := `You are an intelligent deadlock detection and recovery coordinator. When the same error repeats multiple times, you must detect deadlock and suggest recovery.
+	systemPrompt, err := loadPrompt("evaluate_deadlock_system.txt")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load system prompt: %w", err)
+	}
+	if err := validatePrompt(systemPrompt, "evaluate_deadlock_system.txt", false); err != nil {
+		return "", "", fmt.Errorf("system prompt validation failed: %w", err)
+	}
 
-Available actions:
-- "recover_state": Re-establish tool state (e.g., reopen browser, reconnect)
-- "skip": Skip this operation and try alternative approach
-- "adjust_approach": Use a different method to achieve the same goal
-- "end_cycle": End current cycle and start fresh
-- "end_task": End task if deadlock cannot be resolved
+	userPromptTemplate, err := loadPrompt("evaluate_deadlock_user.txt")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load user prompt: %w", err)
+	}
+	if err := validatePrompt(userPromptTemplate, "evaluate_deadlock_user.txt", true); err != nil {
+		return "", "", fmt.Errorf("user prompt validation failed: %w", err)
+	}
 
-You must respond with valid JSON:
-{
-  "action": "string - one of: recover_state, skip, adjust_approach, end_cycle, end_task",
-  "reasoning": "string - detailed explanation",
-  "recovery_steps": ["string"] - optional steps to recover
-}`
-
-	userPrompt := fmt.Sprintf(`Deadlock detected - same error repeating:
-
-Subtask: %s
-Tool: %s
-Error: %s
-Consecutive Failures: %d
-Objective: %s
-
-Execution Context:
-%s
-
-This error has repeated %d times. This indicates a deadlock situation.
-What should we do to recover?
-- Recover tool state if state was lost?
-- Skip and try alternative approach?
-- Adjust the approach entirely?
-- End cycle and start fresh?
-- End task if recovery is impossible?`, subtaskName, toolName, errorMessage, consecutiveFailures, objective, executionContext, consecutiveFailures)
+	userPrompt := fmt.Sprintf(userPromptTemplate, subtaskName, toolName, errorMessage, consecutiveFailures, objective, executionContext, consecutiveFailures)
 
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
 
-	resp, err := c.client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model:       c.model,
-			Messages:    messages,
-			Temperature: 0.5,
-			ResponseFormat: &openai.ChatCompletionResponseFormat{
-				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-			},
+	req := openai.ChatCompletionRequest{
+		Model:       c.model,
+		Messages:    messages,
+		Temperature: 0.5,
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
 		},
-	)
+	}
+	resp, err := c.callWithRetry(context.Background(), req, 3)
 	if err != nil {
 		return "skip", "", fmt.Errorf("LLM evaluation failed: %w", err)
 	}
@@ -806,48 +769,23 @@ func (c *Coordinator) EvaluateSessionLifecycle(
 	executionContext string,
 	objective string,
 ) (string, string, error) {
-	systemPrompt := `You are an intelligent session lifecycle manager. Your job is to decide what to do with tool sessions when errors occur.
+	systemPrompt, err := loadPrompt("evaluate_session_lifecycle_system.txt")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load system prompt: %w", err)
+	}
+	if err := validatePrompt(systemPrompt, "evaluate_session_lifecycle_system.txt", false); err != nil {
+		return "", "", fmt.Errorf("system prompt validation failed: %w", err)
+	}
 
-CRITICAL PRINCIPLES:
-- Sessions are VALUABLE - they represent established connections/state that took time to create
-- Only close sessions when ABSOLUTELY necessary (e.g., unrecoverable errors, explicit user request)
-- Default to PRESERVING sessions - errors may be transient
-- Consider session health: healthy sessions should be preserved even on errors
-- Think about tool consequences: closing a session means losing all state and requiring re-establishment
+	userPromptTemplate, err := loadPrompt("evaluate_session_lifecycle_user.txt")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load user prompt: %w", err)
+	}
+	if err := validatePrompt(userPromptTemplate, "evaluate_session_lifecycle_user.txt", true); err != nil {
+		return "", "", fmt.Errorf("user prompt validation failed: %w", err)
+	}
 
-Available actions:
-- "keep_alive": Keep the session alive and retry the operation (default for healthy sessions)
-- "recover": Attempt to recover the session state (e.g., reconnect, restore state)
-- "recreate": Create a new session (only if current session is unrecoverable)
-- "close": Close the session (only if explicitly needed or session is completely broken)
-
-You must respond with valid JSON:
-{
-  "action": "string - one of: keep_alive, recover, recreate, close",
-  "reasoning": "string - detailed explanation",
-  "should_preserve": boolean - whether session should be preserved
-}`
-
-	userPrompt := fmt.Sprintf(`Evaluate session lifecycle decision:
-
-Tool Type: %s
-Session Health: %s
-Error: %s
-Consecutive Failures: %d
-Total Operations: %d
-Success Rate: %.2f%%
-Objective: %s
-
-Execution Context:
-%s
-
-What should we do with this session?
-- Keep alive if session is healthy and error might be transient?
-- Recover if session state might be lost but recoverable?
-- Recreate if session is completely broken?
-- Close only if explicitly necessary?
-
-Remember: Sessions are valuable - preserve them unless there's a strong reason to close.`, 
+	userPrompt := fmt.Sprintf(userPromptTemplate,
 		toolType, sessionHealth, errorMessage, consecutiveFailures, totalOperations, successRate*100, objective, executionContext)
 
 	messages := []openai.ChatCompletionMessage{
@@ -855,17 +793,15 @@ Remember: Sessions are valuable - preserve them unless there's a strong reason t
 		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
 
-	resp, err := c.client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model:       c.model,
-			Messages:    messages,
-			Temperature: 0.3, // Lower temperature for consistent decisions
-			ResponseFormat: &openai.ChatCompletionResponseFormat{
-				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-			},
+	req := openai.ChatCompletionRequest{
+		Model:       c.model,
+		Messages:    messages,
+		Temperature: 0.3, // Lower temperature for consistent decisions
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
 		},
-	)
+	}
+	resp, err := c.callWithRetry(context.Background(), req, 3)
 	if err != nil {
 		return "keep_alive", "", fmt.Errorf("LLM evaluation failed: %w", err)
 	}
@@ -887,9 +823,9 @@ Remember: Sessions are valuable - preserve them unless there's a strong reason t
 	}
 
 	var result struct {
-		Action        string `json:"action"`
-		Reasoning     string `json:"reasoning"`
-		ShouldPreserve bool  `json:"should_preserve"`
+		Action         string `json:"action"`
+		Reasoning      string `json:"reasoning"`
+		ShouldPreserve bool   `json:"should_preserve"`
 	}
 
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
@@ -909,49 +845,23 @@ func (c *Coordinator) EvaluateMCPHealth(
 	objective string,
 	taskProgress string,
 ) (string, string, error) {
-	systemPrompt := `You are an intelligent MCP health evaluator. Your job is to determine if the MCP server is dead or recoverable.
+	systemPrompt, err := loadPrompt("evaluate_mcp_health_system.txt")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load system prompt: %w", err)
+	}
+	if err := validatePrompt(systemPrompt, "evaluate_mcp_health_system.txt", false); err != nil {
+		return "", "", fmt.Errorf("system prompt validation failed: %w", err)
+	}
 
-CRITICAL UNDERSTANDING:
-- MCP (Model Context Protocol) server provides tools needed for task execution
-- If MCP server is completely dead, task cannot proceed
-- Connection failures may be transient (network issues, server restart)
-- Repeated failures after reconnection attempts indicate server death
-- Task progress should be considered: if near completion, may be worth waiting
+	userPromptTemplate, err := loadPrompt("evaluate_mcp_health_user.txt")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to load user prompt: %w", err)
+	}
+	if err := validatePrompt(userPromptTemplate, "evaluate_mcp_health_user.txt", true); err != nil {
+		return "", "", fmt.Errorf("user prompt validation failed: %w", err)
+	}
 
-Available actions:
-- "continue": Continue task execution (MCP is healthy or recoverable)
-- "retry_connection": Retry MCP connection (server may be temporarily unavailable)
-- "stop_task": Stop entire task execution (MCP is dead and cannot be recovered)
-
-You must respond with valid JSON:
-{
-  "action": "string - one of: continue, retry_connection, stop_task",
-  "reasoning": "string - detailed explanation",
-  "mcp_status": "string - one of: healthy, degraded, unresponsive, dead"
-}`
-
-	userPrompt := fmt.Sprintf(`Evaluate MCP server health:
-
-MCP Health Status: %s
-Consecutive Failures: %d
-Reconnection Attempts: %d
-Time Since Last Success: %v
-Objective: %s
-Task Progress: %s
-
-Execution Context:
-%s
-
-What should we do?
-- Continue if MCP is healthy or failures are transient?
-- Retry connection if server may be temporarily unavailable?
-- Stop task if MCP is dead and cannot be recovered?
-
-Consider:
-- If failures are recent and few, may be transient
-- If many failures after reconnection attempts, server likely dead
-- If task is near completion, may be worth waiting
-- If task just started, better to stop early`, 
+	userPrompt := fmt.Sprintf(userPromptTemplate,
 		mcpHealth, consecutiveFailures, reconnectAttempts, timeSinceLastSuccess, objective, taskProgress, executionContext)
 
 	messages := []openai.ChatCompletionMessage{
@@ -959,17 +869,15 @@ Consider:
 		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
 
-	resp, err := c.client.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model:       c.model,
-			Messages:    messages,
-			Temperature: 0.3, // Lower temperature for consistent decisions
-			ResponseFormat: &openai.ChatCompletionResponseFormat{
-				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-			},
+	req := openai.ChatCompletionRequest{
+		Model:       c.model,
+		Messages:    messages,
+		Temperature: 0.3, // Lower temperature for consistent decisions
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
 		},
-	)
+	}
+	resp, err := c.callWithRetry(context.Background(), req, 3)
 	if err != nil {
 		return "continue", "", fmt.Errorf("LLM evaluation failed: %w", err)
 	}
@@ -991,9 +899,9 @@ Consider:
 	}
 
 	var result struct {
-		Action     string `json:"action"`
-		Reasoning  string `json:"reasoning"`
-		MCPStatus  string `json:"mcp_status"`
+		Action    string `json:"action"`
+		Reasoning string `json:"reasoning"`
+		MCPStatus string `json:"mcp_status"`
 	}
 
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
@@ -1002,4 +910,3 @@ Consider:
 
 	return result.Action, result.Reasoning, nil
 }
-

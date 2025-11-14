@@ -1,2 +1,11 @@
-Objective, UseMCP, and Open Google And Search for 10 Movie Stars and find their Names, Networth and Age. Wait 30 seconds afte each serach.
+TASK: 
+Playwright MCP is available. Which provides multiple tools to interact with Chrome browser.
+Now use this MCP tool to plan a task:
+Task Objective: Goto Google, Gather 10 Interesting Movies. You can search from Google.
 
+IMPORTANT
+    - DO NOT CLOSE TAB / END SESSION AFTER INITIAL TASK
+    - KEEP USING SAME SESSION TO EXECUTE FOLLOWING TASK
+    - USE browser_snapshot TOOL TO VALIDATE CURRENT STATE AND PLAN NEXT MOVE.
+    - IF PREVIOUS EXECUTION CLOSED TASK OR SESSION DEGRATED, END ALL.
+    

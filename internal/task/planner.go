@@ -45,9 +45,10 @@ type PlanExceptionRule struct {
 
 // Planner handles LLM-based task planning
 type Planner struct {
-	llmCoord  *llm.Coordinator
-	mcpClient *mcp.Client
-	logger    *logger.Logger
+	llmCoord   *llm.Coordinator
+	mcpClient  *mcp.Client
+	logger     *logger.Logger
+	lastPlan   *PlanResult // Store last plan result for todo generation
 }
 
 // NewPlanner creates a new planner
@@ -119,6 +120,9 @@ func (p *Planner) PlanTask(objective string) (*TaskSpec, error) {
 		}
 	}
 
+	// Store plan result for todo generation
+	p.lastPlan = &planResult
+
 	// Convert plan result to TaskSpec
 	spec := p.convertPlanToTaskSpec(&planResult)
 	
@@ -143,6 +147,39 @@ func (p *Planner) PlanTask(objective string) (*TaskSpec, error) {
 	}
 
 	return spec, nil
+}
+
+// GetTodos generates todo items from the last plan
+func (p *Planner) GetTodos() []*PlanTodo {
+	if p.lastPlan == nil {
+		return nil
+	}
+	return GenerateTodosFromPlan(p.lastPlan)
+}
+
+// GenerateTodosFromPlan generates todo items from a plan result
+func GenerateTodosFromPlan(plan *PlanResult) []*PlanTodo {
+	todos := make([]*PlanTodo, 0, len(plan.Tasks))
+	for i, task := range plan.Tasks {
+		todo := &PlanTodo{
+			ID:          i + 1,
+			Name:        task.Name,
+			Description: task.Description,
+			Status:      "pending",
+			ToolName:    task.ToolName,
+		}
+		todos = append(todos, todo)
+	}
+	return todos
+}
+
+// PlanTodo represents a todo item generated from a plan (before conversion to TUI format)
+type PlanTodo struct {
+	ID          int
+	Name        string
+	Description string
+	Status      string // "pending", "in_progress", "completed", "failed"
+	ToolName    string
 }
 
 // convertPlanToTaskSpec converts PlanResult to TaskSpec

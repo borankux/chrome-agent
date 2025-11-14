@@ -7,33 +7,40 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
+
+	"chrome-agent/internal/config"
 )
 
 // Client handles communication with MCP server
 type Client struct {
-	def        *MCPDefinition
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	stdout     *bufio.Scanner
-	stderr     io.ReadCloser
-	httpClient *http.Client
-	httpURL    string
-	httpStream io.ReadCloser
-	sseURL     string
-	sseStream  io.ReadCloser
-	sseCancel  context.CancelFunc
-	sessionID  string
-	connected  bool
-	serverInfo *ServerInfo
-	mu         sync.Mutex
-	requestID  int64
-	pending    map[int64]chan *Response
+	def         *MCPDefinition
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	stdout      *bufio.Scanner
+	stderr      io.ReadCloser
+	httpClient  *http.Client
+	httpURL     string
+	httpStream  io.ReadCloser
+	sseURL      string
+	sseStream   io.ReadCloser
+	sseCancel   context.CancelFunc
+	sessionID   string
+	connected   bool
+	serverInfo  *ServerInfo
+	mu          sync.Mutex
+	requestID   int64
+	pending     map[int64]chan *Response
+	proxyConfig *config.ProxyConfig // Proxy configuration
 	// Health tracking
 	consecutiveFailures  int
 	lastSuccessfulCall   time.Time
@@ -90,10 +97,11 @@ type CallToolParams struct {
 }
 
 // NewClient creates a new MCP client
-func NewClient(def *MCPDefinition) *Client {
+func NewClient(def *MCPDefinition, proxyConfig *config.ProxyConfig) *Client {
 	return &Client{
 		def:                  def,
 		pending:              make(map[int64]chan *Response),
+		proxyConfig:          proxyConfig,
 		maxReconnectAttempts: 5, // Maximum reconnection attempts before declaring dead
 	}
 }
@@ -125,6 +133,11 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) connectStdio() error {
+	// Validate command is provided
+	if len(c.def.Transport.Command) == 0 {
+		return fmt.Errorf("stdio transport requires a command")
+	}
+
 	cmd := exec.Command(c.def.Transport.Command[0], c.def.Transport.Command[1:]...)
 
 	// Set environment variables
@@ -142,15 +155,21 @@ func (c *Client) connectStdio() error {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		stdin.Close()
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		stdin.Close()
+		stdout.Close()
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		stdin.Close()
+		stdout.Close()
+		stderr.Close()
 		return fmt.Errorf("failed to start MCP server: %w", err)
 	}
 
@@ -159,9 +178,15 @@ func (c *Client) connectStdio() error {
 	c.stdout = bufio.NewScanner(stdout)
 	c.stderr = stderr
 
+	// Increase scanner buffer size for large responses
+	c.stdout.Buffer(make([]byte, 64*1024), 1024*1024)
+
 	// Start response handler
 	go c.handleResponses()
 	go c.handleStderr()
+
+	// Monitor subprocess exit
+	go c.monitorSubprocess()
 
 	// Initialize connection
 	if err := c.initialize(); err != nil {
@@ -169,10 +194,12 @@ func (c *Client) connectStdio() error {
 		return fmt.Errorf("failed to initialize MCP connection: %w", err)
 	}
 
+	c.mu.Lock()
 	c.connected = true
 	c.lastSuccessfulCall = time.Now()
 	c.consecutiveFailures = 0
 	c.reconnectAttempts = 0
+	c.mu.Unlock()
 	return nil
 }
 
@@ -196,9 +223,7 @@ func (c *Client) connectSSE() error {
 		return fmt.Errorf("sse.url or http.url is required for SSE transport")
 	}
 
-	c.httpClient = &http.Client{
-		Timeout: 0, // No timeout for SSE connections
-	}
+	c.httpClient = c.createHTTPClient()
 	c.httpURL = baseURL
 	c.sseURL = sseURL
 
@@ -337,9 +362,7 @@ func (c *Client) connectHTTP() error {
 		return fmt.Errorf("http.url is required for http transport")
 	}
 
-	c.httpClient = &http.Client{
-		Timeout: 0, // No timeout for streaming connections
-	}
+	c.httpClient = c.createHTTPClient()
 	c.httpURL = c.def.Transport.HTTP.URL
 
 	// Initialize connection (will use callHTTP which handles streaming)
@@ -400,6 +423,7 @@ func (c *Client) handleResponses() {
 
 		var resp Response
 		if err := json.Unmarshal(line, &resp); err != nil {
+			// Log parse errors but continue processing
 			continue
 		}
 
@@ -411,8 +435,20 @@ func (c *Client) handleResponses() {
 			select {
 			case ch <- &resp:
 			default:
+				// Channel full, skip (shouldn't happen with buffered channel)
 			}
 		}
+	}
+
+	// Scanner stopped - check for errors
+	if err := c.stdout.Err(); err != nil {
+		// Handle broken pipe or other I/O errors
+		c.mu.Lock()
+		if c.connected {
+			c.connected = false
+			c.lastFailureTime = time.Now()
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -525,10 +561,41 @@ func (c *Client) handleSSEStream() {
 }
 
 func (c *Client) handleStderr() {
+	if c.stderr == nil {
+		return
+	}
 	scanner := bufio.NewScanner(c.stderr)
 	for scanner.Scan() {
-		// Consume stderr output
+		// Consume stderr output (could be logged in the future)
 		_ = scanner.Text()
+	}
+	// stderr closed - subprocess may have exited
+}
+
+// monitorSubprocess monitors the subprocess and marks connection as disconnected if it exits unexpectedly
+func (c *Client) monitorSubprocess() {
+	if c.cmd == nil {
+		return
+	}
+
+	err := c.cmd.Wait()
+	if err != nil {
+		// Subprocess exited with error
+		c.mu.Lock()
+		if c.connected {
+			c.connected = false
+			c.lastFailureTime = time.Now()
+			c.consecutiveFailures++
+		}
+		c.mu.Unlock()
+	} else {
+		// Subprocess exited normally
+		c.mu.Lock()
+		if c.connected {
+			c.connected = false
+			c.lastFailureTime = time.Now()
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -556,6 +623,15 @@ func (c *Client) call(method string, params interface{}) (*Response, error) {
 	}
 
 	// Use stdio transport
+	// Check if stdin is available
+	c.mu.Lock()
+	if c.stdin == nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("stdio transport not connected")
+	}
+	stdin := c.stdin
+	c.mu.Unlock()
+
 	ch := make(chan *Response, 1)
 	c.mu.Lock()
 	c.pending[id] = ch
@@ -567,7 +643,16 @@ func (c *Client) call(method string, params interface{}) (*Response, error) {
 		c.mu.Unlock()
 	}()
 
-	if _, err := fmt.Fprintf(c.stdin, "%s\n", data); err != nil {
+	// Send request with error handling for broken pipe
+	if _, err := fmt.Fprintf(stdin, "%s\n", data); err != nil {
+		// Check if this is a broken pipe error (subprocess crashed)
+		if strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "write") {
+			c.mu.Lock()
+			c.connected = false
+			c.lastFailureTime = time.Now()
+			c.mu.Unlock()
+			return nil, fmt.Errorf("stdio transport connection lost: %w", err)
+		}
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
@@ -671,10 +756,7 @@ func (c *Client) callHTTP(data []byte) (*Response, error) {
 
 func (c *Client) callSSE(data []byte, requestID int64) (*Response, error) {
 	// For SSE with Playwright MCP, each request establishes its own SSE connection
-	baseURL := c.sseURL
-	if strings.HasSuffix(baseURL, "/messages") {
-		baseURL = strings.TrimSuffix(baseURL, "/messages")
-	}
+	baseURL := strings.TrimSuffix(c.sseURL, "/messages")
 	if baseURL == "" && c.def.Transport.HTTP != nil {
 		baseURL = c.def.Transport.HTTP.URL
 	}
@@ -768,10 +850,7 @@ func (c *Client) notify(method string, params interface{}) error {
 		baseURL := c.httpURL
 		if c.sseStream != nil && c.sseURL != "" {
 			// For SSE, send to base URL (not /messages)
-			baseURL = c.sseURL
-			if strings.HasSuffix(baseURL, "/messages") {
-				baseURL = strings.TrimSuffix(baseURL, "/messages")
-			}
+			baseURL = strings.TrimSuffix(c.sseURL, "/messages")
 			if baseURL == "" && c.def.Transport.HTTP != nil {
 				baseURL = c.def.Transport.HTTP.URL
 			}
@@ -795,7 +874,25 @@ func (c *Client) notify(method string, params interface{}) error {
 		return nil
 	}
 
-	_, err = fmt.Fprintf(c.stdin, "%s\n", data)
+	c.mu.Lock()
+	stdin := c.stdin
+	c.mu.Unlock()
+
+	if stdin == nil {
+		return fmt.Errorf("stdio transport not connected")
+	}
+
+	_, err = fmt.Fprintf(stdin, "%s\n", data)
+	if err != nil {
+		// Check if this is a broken pipe error
+		if strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "write") {
+			c.mu.Lock()
+			c.connected = false
+			c.lastFailureTime = time.Now()
+			c.mu.Unlock()
+			return fmt.Errorf("stdio transport connection lost: %w", err)
+		}
+	}
 	return err
 }
 
@@ -900,7 +997,11 @@ func (c *Client) ListTools() ([]ToolDefinition, error) {
 // CallTool executes a tool with given parameters
 func (c *Client) CallTool(name string, arguments map[string]interface{}) (json.RawMessage, error) {
 	if !c.connected {
-		return nil, fmt.Errorf("not connected to MCP server")
+		// Try to reconnect
+		if err := c.Reconnect(); err != nil {
+			c.recordFailure()
+			return nil, fmt.Errorf("not connected to MCP server and reconnection failed: %w", err)
+		}
 	}
 
 	params := CallToolParams{
@@ -910,9 +1011,31 @@ func (c *Client) CallTool(name string, arguments map[string]interface{}) (json.R
 
 	resp, err := c.call("tools/call", params)
 	if err != nil {
-		// Abstract error - convert specific errors to abstract concepts
-		return nil, c.abstractError(err, name)
+		// Check if this is a connection error
+		if c.isConnectionError(err) {
+			c.recordFailure()
+			// Try to reconnect
+			if reconnectErr := c.Reconnect(); reconnectErr != nil {
+				c.recordFailure()
+				// Abstract error - convert specific errors to abstract concepts
+				return nil, c.abstractError(err, name)
+			}
+			// Retry the call after reconnection (which calls initialize)
+			resp, err = c.call("tools/call", params)
+			if err != nil {
+				c.recordFailure()
+				// Abstract error - convert specific errors to abstract concepts
+				return nil, c.abstractError(err, name)
+			}
+		} else {
+			c.recordFailure()
+			// Abstract error - convert specific errors to abstract concepts
+			return nil, c.abstractError(err, name)
+		}
 	}
+
+	// Success - record it
+	c.recordSuccess()
 
 	var toolResult struct {
 		Content []struct {
@@ -928,7 +1051,12 @@ func (c *Client) CallTool(name string, arguments map[string]interface{}) (json.R
 	}
 
 	if toolResult.IsError {
-		return nil, fmt.Errorf("tool execution error")
+		// Extract error message if available
+		errorMsg := "tool execution error"
+		if len(toolResult.Content) > 0 && toolResult.Content[0].Text != "" {
+			errorMsg = toolResult.Content[0].Text
+		}
+		return nil, fmt.Errorf("tool execution error: %s", errorMsg)
 	}
 
 	// Return first content item's text or data
@@ -977,14 +1105,44 @@ func (c *Client) Disconnect() error {
 
 	c.connected = false
 
+	// Close stdio pipes
 	if c.stdin != nil {
 		c.stdin.Close()
+		c.stdin = nil
 	}
 
-	if c.cmd != nil {
-		c.cmd.Process.Kill()
-		c.cmd.Wait()
+	if c.stderr != nil {
+		c.stderr.Close()
+		c.stderr = nil
 	}
+
+	// Kill subprocess if running
+	if c.cmd != nil {
+		// Try graceful shutdown first
+		if c.cmd.Process != nil {
+			c.cmd.Process.Kill()
+		}
+		// Wait for process to exit (with timeout)
+		// Note: Wait() can be called multiple times safely, so this won't conflict with monitorSubprocess
+		done := make(chan error, 1)
+		go func() {
+			done <- c.cmd.Wait()
+		}()
+		select {
+		case <-done:
+			// Process exited
+		case <-time.After(2 * time.Second):
+			// Timeout - force kill (process may have already exited, but kill is safe)
+			if c.cmd.Process != nil {
+				c.cmd.Process.Kill()
+				// Wait one more time after force kill
+				<-done
+			}
+		}
+		c.cmd = nil
+	}
+
+	c.stdout = nil
 
 	// Close HTTP stream if open
 	if c.httpStream != nil {
@@ -1011,6 +1169,89 @@ func (c *Client) Disconnect() error {
 	return nil
 }
 
+// createHTTPClient creates an HTTP client with proxy support
+func (c *Client) createHTTPClient() *http.Client {
+	transport := &http.Transport{
+		Proxy: c.proxyFunc(),
+	}
+
+	// If SOCKS5 proxy is configured, use SOCKS5 dialer
+	if c.proxyConfig != nil && c.proxyConfig.AllProxy != "" {
+		if strings.HasPrefix(c.proxyConfig.AllProxy, "socks5://") {
+			socksURL := c.proxyConfig.AllProxy
+			dialer, err := proxy.SOCKS5("tcp", strings.TrimPrefix(socksURL, "socks5://"), nil, proxy.Direct)
+			if err == nil {
+				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.Dial(network, addr)
+				}
+			}
+		}
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   0, // No timeout for streaming connections
+	}
+}
+
+// proxyFunc returns a proxy function for HTTP transport
+func (c *Client) proxyFunc() func(*http.Request) (*url.URL, error) {
+	if c.proxyConfig == nil {
+		// Fallback to environment variables
+		return http.ProxyFromEnvironment
+	}
+
+	return func(req *http.Request) (*url.URL, error) {
+		// Check no_proxy list
+		if c.proxyConfig.NoProxy != "" {
+			host := req.URL.Hostname()
+			noProxyList := strings.Split(c.proxyConfig.NoProxy, ",")
+			for _, pattern := range noProxyList {
+				pattern = strings.TrimSpace(pattern)
+				if pattern == "" {
+					continue
+				}
+				// Simple pattern matching (exact match or suffix match)
+				if host == pattern || strings.HasSuffix(host, "."+pattern) {
+					return nil, nil // No proxy
+				}
+			}
+		}
+
+		// Determine which proxy to use based on scheme
+		var proxyURL string
+		if req.URL.Scheme == "https" {
+			if c.proxyConfig.HTTPSProxy != "" {
+				proxyURL = c.proxyConfig.HTTPSProxy
+			} else if c.proxyConfig.HTTPProxy != "" {
+				proxyURL = c.proxyConfig.HTTPProxy
+			}
+		} else {
+			if c.proxyConfig.HTTPProxy != "" {
+				proxyURL = c.proxyConfig.HTTPProxy
+			}
+		}
+
+		// If all_proxy is set and no specific proxy found, use all_proxy (but not SOCKS5 here)
+		if proxyURL == "" && c.proxyConfig.AllProxy != "" {
+			if !strings.HasPrefix(c.proxyConfig.AllProxy, "socks5://") {
+				proxyURL = c.proxyConfig.AllProxy
+			}
+		}
+
+		if proxyURL == "" {
+			// Fallback to environment variables
+			return http.ProxyFromEnvironment(req)
+		}
+
+		parsedURL, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, err
+		}
+		return parsedURL, nil
+	}
+}
+
 // GetDefinition returns the loaded MCP definition
 func (c *Client) GetDefinition() *MCPDefinition {
 	return c.def
@@ -1019,42 +1260,22 @@ func (c *Client) GetDefinition() *MCPDefinition {
 // Reconnect attempts to reconnect to the MCP server
 func (c *Client) Reconnect() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// If already connected, check health first
 	if c.connected {
 		// Quick health check
 		if time.Since(c.lastSuccessfulCall) < 30*time.Second {
+			c.mu.Unlock()
 			return nil // Recently successful, assume healthy
 		}
 	}
+	c.mu.Unlock()
 
-	// Disconnect existing connection
-	if c.connected {
-		c.connected = false
-		if c.stdin != nil {
-			c.stdin.Close()
-		}
-		if c.cmd != nil {
-			c.cmd.Process.Kill()
-			c.cmd.Wait()
-		}
-		if c.httpStream != nil {
-			c.httpStream.Close()
-			c.httpStream = nil
-		}
-		if c.sseStream != nil {
-			c.sseStream.Close()
-			c.sseStream = nil
-		}
-		if c.sseCancel != nil {
-			c.sseCancel()
-			c.sseCancel = nil
-		}
-	}
+	// Disconnect existing connection (unlock first to avoid deadlock)
+	c.Disconnect()
 
 	// Attempt reconnection with exponential backoff
 	maxAttempts := 3
+	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(attempt) * time.Second
@@ -1063,15 +1284,19 @@ func (c *Client) Reconnect() error {
 
 		err := c.Connect()
 		if err == nil {
+			c.mu.Lock()
 			c.reconnectAttempts = 0
-			c.connected = true
+			c.mu.Unlock()
 			return nil
 		}
 
+		lastErr = err
+		c.mu.Lock()
 		c.reconnectAttempts++
+		c.mu.Unlock()
 	}
 
-	return fmt.Errorf("failed to reconnect after %d attempts", maxAttempts)
+	return fmt.Errorf("failed to reconnect after %d attempts: %w", maxAttempts, lastErr)
 }
 
 // recordSuccess records a successful MCP call
@@ -1109,6 +1334,11 @@ func (c *Client) isConnectionError(err error) bool {
 		"dial",
 		"http request failed",
 		"sse connection failed",
+		"stdio transport",
+		"failed to send request",
+		"failed to start",
+		"process",
+		"pipe",
 	}
 	for _, pattern := range connectionErrors {
 		if strings.Contains(errStr, pattern) {

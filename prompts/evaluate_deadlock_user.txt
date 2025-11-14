@@ -1,0 +1,19 @@
+Deadlock detected - same error repeating:
+
+Subtask: %s
+Tool: %s
+Error: %s
+Consecutive Failures: %d
+Objective: %s
+
+Execution Context:
+%s
+
+This error has repeated %d times. This indicates a deadlock situation.
+What should we do to recover?
+- Recover tool state if state was lost?
+- Skip and try alternative approach?
+- Adjust the approach entirely?
+- End cycle and start fresh?
+- End task if recovery is impossible?
+

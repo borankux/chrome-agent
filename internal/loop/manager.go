@@ -88,6 +88,9 @@ func (m *Manager) ExecuteLoop() error {
 			}
 			
 			loopTypeStr := string(loop.Type)
+			m.logger.Info("Asking LLM to evaluate loop completion - Objective: %s, Cycle: %d, Progress: %.2f/%.2f, Type: %s", 
+				spec.Objective, cycleNumber, progress, loop.TargetValue, loopTypeStr)
+			
 			shouldComplete, llmReasoning, err = m.llmCoord.EvaluateLoopCompletion(
 				contextStr,
 				loopTypeStr,
@@ -98,10 +101,11 @@ func (m *Manager) ExecuteLoop() error {
 			)
 			if err != nil {
 				m.logger.Warn("LLM loop evaluation failed: %v, using mechanical check", err)
+				m.logger.Info("LLM error details: %v", err)
 				shouldComplete = mechanicalConditionMet
 			} else {
 				m.logger.Info("LLM loop evaluation: should_complete=%v", shouldComplete)
-				m.logger.Debug("LLM reasoning: %s", llmReasoning)
+				m.logger.Info("LLM reasoning: %s", llmReasoning)
 			}
 		} else {
 			// Fallback to mechanical check if no LLM coordinator
@@ -183,6 +187,10 @@ func (m *Manager) ExecuteLoop() error {
 			// Update context with current subtask name
 			execCtx.SubtaskName = rule.Name
 			
+			// Log subtask details
+			m.logger.Info("Executing subtask: %s (ID: %d, Cycle: %d, Description: %s)", rule.Name, subtaskID, cycleNumber, rule.Description)
+			m.logger.Info("Task objective: %s", spec.Objective)
+			
 			// Update TUI with current subtask
 			if m.tuiModel != nil {
 				m.tuiModel.SendUpdate(tui.ExecutionUpdateMsg{
@@ -196,6 +204,8 @@ func (m *Manager) ExecuteLoop() error {
 			var result *task.ExecutionResult
 			var execErr error
 			var savedStateSnapshot string
+			deadlockRecoveryAttempts := 0
+			const maxDeadlockRecoveryAttempts = 3
 			
 			for {
 				// Get current subtask state
@@ -223,9 +233,19 @@ func (m *Manager) ExecuteLoop() error {
 				// Check for deadlock (same error repeating)
 				isDeadlock := strings.Contains(execErr.Error(), "DEADLOCK:")
 				if isDeadlock && m.llmCoord != nil {
-					m.logger.Warn("Deadlock detected, asking LLM for recovery strategy")
+					deadlockRecoveryAttempts++
+					m.logger.Warn("Deadlock detected (attempt %d/%d), asking LLM for recovery strategy", deadlockRecoveryAttempts, maxDeadlockRecoveryAttempts)
+					m.logger.Info("Deadlock details - Subtask: %s, Error: %s, Cycle: %d", rule.Name, execErr.Error(), cycleNumber)
+					
+					// Check if we've exceeded max deadlock recovery attempts
+					if deadlockRecoveryAttempts > maxDeadlockRecoveryAttempts {
+						m.logger.Error("Max deadlock recovery attempts (%d) exceeded for subtask '%s', skipping subtask", maxDeadlockRecoveryAttempts, rule.Name)
+						break // Skip this subtask
+					}
 					
 					contextStr := m.executor.BuildContextString(execCtx, rule)
+					m.logger.Info("Asking LLM for deadlock recovery - Context: %s", contextStr)
+					
 					action, reasoning, err := m.llmCoord.EvaluateDeadlock(
 						rule.Name,
 						"", // Tool name extracted from error if needed
@@ -236,9 +256,10 @@ func (m *Manager) ExecuteLoop() error {
 					)
 					if err != nil {
 						m.logger.Warn("LLM deadlock evaluation failed: %v", err)
+						m.logger.Info("LLM error details: %v", err)
 					} else {
 						m.logger.Info("LLM deadlock recovery decision: %s", action)
-						m.logger.Debug("LLM reasoning: %s", reasoning)
+						m.logger.Info("LLM reasoning: %s", reasoning)
 						
 						// Send prompt to TUI if available
 						if m.tuiModel != nil {
@@ -251,12 +272,13 @@ func (m *Manager) ExecuteLoop() error {
 						// Execute LLM decision
 						switch action {
 						case "end_task":
+							m.logger.Info("LLM decided to end task due to deadlock - Reason: %s", reasoning)
 							return fmt.Errorf("LLM decided to end task due to deadlock: %w", execErr)
 						case "end_cycle":
-							m.logger.Info("LLM decided to end cycle due to deadlock")
+							m.logger.Info("LLM decided to end cycle due to deadlock - Reason: %s", reasoning)
 							break // Exit retry loop, continue to next subtask
 						case "recover_state":
-							m.logger.Info("LLM decided to recover state to resolve deadlock")
+							m.logger.Info("LLM decided to recover state to resolve deadlock - Reason: %s", reasoning)
 							
 							// Check if this is a browser session loss error
 							isSessionLoss := strings.Contains(execErr.Error(), "tool state") && 
@@ -302,18 +324,20 @@ func (m *Manager) ExecuteLoop() error {
 								if savedStateSnapshot != "" && savedStateSnapshot != "{}" {
 									if err := m.executor.RestoreState(savedStateSnapshot); err != nil {
 										m.logger.Warn("State recovery failed: %v", err)
+									} else {
+										m.logger.Info("State recovered successfully, retrying subtask")
 									}
 								}
 								// Retry after state recovery
 								continue
 							}
 						case "adjust_approach":
-							m.logger.Info("LLM decided to adjust approach due to deadlock - skipping subtask")
+							m.logger.Info("LLM decided to adjust approach due to deadlock - skipping subtask - Reason: %s", reasoning)
 							break // Skip this subtask
 						case "skip":
 							fallthrough
 						default:
-							m.logger.Info("LLM decided to skip subtask due to deadlock")
+							m.logger.Info("LLM decided to skip subtask due to deadlock - Reason: %s", reasoning)
 							break // Skip this subtask
 						}
 					}
@@ -330,11 +354,26 @@ func (m *Manager) ExecuteLoop() error {
 				
 				// Check retry limit
 				if subtask.RetryCount >= subtask.MaxRetries {
-					m.logger.Error("Retry limit (%d) exceeded for subtask '%s'", subtask.MaxRetries, rule.Name)
+					m.logger.Error("Retry limit (%d) exceeded for subtask '%s' (ID: %d)", subtask.MaxRetries, rule.Name, subtaskID)
+					m.logger.Info("Subtask details - Name: %s, Description: %s, Error: %s", rule.Name, rule.Description, execErr.Error())
 					
-					// Ask LLM what to do when retries are exhausted
+					// Check if loop quota is met before asking LLM
+					quotaMet, err := m.taskManager.CheckLoopCondition()
+					if err != nil {
+						m.logger.Warn("Failed to check loop condition: %v", err)
+					} else if quotaMet {
+						m.logger.Info("Loop quota condition met (quota check returned true), completing loop gracefully")
+						if err := m.taskManager.CompleteLoop(); err != nil {
+							return fmt.Errorf("failed to complete loop: %w", err)
+						}
+						return nil
+					}
+					
+					// Ask LLM what to do when retries are exhausted (only if quota not met)
 					if m.llmCoord != nil {
 						contextStr := m.executor.BuildContextString(execCtx, rule)
+						m.logger.Info("Asking LLM for retry exhaustion decision - Context: %s", contextStr)
+						
 						action, reasoning, err := m.llmCoord.EvaluateRetryExhaustion(
 							rule.Name,
 							"", // Tool name not available here
@@ -346,10 +385,11 @@ func (m *Manager) ExecuteLoop() error {
 						)
 						if err != nil {
 							m.logger.Warn("LLM retry exhaustion evaluation failed: %v", err)
+							m.logger.Info("LLM error details: %v", err)
 							action = "skip" // Default to skip
 						} else {
 							m.logger.Info("LLM decision for retry exhaustion: %s", action)
-							m.logger.Debug("LLM reasoning: %s", reasoning)
+							m.logger.Info("LLM reasoning: %s", reasoning)
 							
 							// Send prompt to TUI if available
 							if m.tuiModel != nil {
@@ -363,12 +403,13 @@ func (m *Manager) ExecuteLoop() error {
 						// Execute LLM decision
 						switch action {
 						case "end_task":
+							m.logger.Info("LLM decided to end task after retry exhaustion - Reason: %s", reasoning)
 							return fmt.Errorf("LLM decided to end task after retry exhaustion: %w", execErr)
 						case "end_cycle":
-							m.logger.Info("LLM decided to end cycle, moving to next cycle")
+							m.logger.Info("LLM decided to end cycle, moving to next cycle - Reason: %s", reasoning)
 							break // Exit retry loop, continue to next subtask
 						case "recover_state":
-							m.logger.Info("LLM decided to recover state")
+							m.logger.Info("LLM decided to recover state - Reason: %s", reasoning)
 							
 							// Check if this is a browser session loss error
 							isSessionLoss := strings.Contains(execErr.Error(), "tool state") && 
@@ -424,16 +465,16 @@ func (m *Manager) ExecuteLoop() error {
 								break
 							}
 						case "adjust_approach":
-							m.logger.Info("LLM decided to adjust approach - skipping subtask")
+							m.logger.Info("LLM decided to adjust approach - skipping subtask - Reason: %s", reasoning)
 							break // Skip this subtask
 						case "keep_session":
-							m.logger.Info("LLM decided to keep session alive and retry")
+							m.logger.Info("LLM decided to keep session alive and retry - Reason: %s", reasoning)
 							// Session is preserved, retry the subtask
 							continue
 						case "skip":
 							fallthrough
 						default:
-							m.logger.Info("LLM decided to skip subtask and continue")
+							m.logger.Info("LLM decided to skip subtask and continue - Reason: %s", reasoning)
 							break // Skip this subtask
 						}
 					}

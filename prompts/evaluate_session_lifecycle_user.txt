@@ -1,0 +1,21 @@
+Evaluate session lifecycle decision:
+
+Tool Type: %s
+Session Health: %s
+Error: %s
+Consecutive Failures: %d
+Total Operations: %d
+Success Rate: %.2f%%
+Objective: %s
+
+Execution Context:
+%s
+
+What should we do with this session?
+- Keep alive if session is healthy and error might be transient?
+- Recover if session state might be lost but recoverable?
+- Recreate if session is completely broken?
+- Close only if explicitly necessary?
+
+Remember: Sessions are valuable - preserve them unless there's a strong reason to close.
+

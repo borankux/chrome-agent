@@ -3,6 +3,7 @@ package logger
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -24,19 +25,24 @@ type TUIBackend interface {
 }
 
 type Logger struct {
-	level    Level
-	prefix   string
+	level      Level
+	prefix     string
 	tuiBackend TUIBackend
-	mu       sync.Mutex
-	useTUI   bool
+	mu         sync.Mutex
+	useTUI     bool
+	logFile    *os.File
+	logFilePath string
+	logFileMu  sync.Mutex
 }
 
 func New(level Level, prefix string) *Logger {
-	return &Logger{
+	l := &Logger{
 		level:  level,
 		prefix: prefix,
 		useTUI: false,
 	}
+	l.initLogFile()
+	return l
 }
 
 // SetTUIBackend sets the TUI backend for logging
@@ -52,6 +58,88 @@ func (l *Logger) SetTUIEnabled(enabled bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.useTUI = enabled && l.tuiBackend != nil
+}
+
+// initLogFile initializes the log file with date prefix and number suffix
+func (l *Logger) initLogFile() {
+	l.logFileMu.Lock()
+	defer l.logFileMu.Unlock()
+
+	// Create logs directory if it doesn't exist
+	logsDir := "logs"
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		// If we can't create the directory, log to stderr and continue without file logging
+		fmt.Fprintf(os.Stderr, "Warning: Failed to create logs directory: %v\n", err)
+		return
+	}
+
+	// Generate log filename with date prefix
+	now := time.Now()
+	datePrefix := now.Format("2006-01-02")
+	
+	// Find next available number for today's date
+	logNum := 1
+	for {
+		filename := fmt.Sprintf("%s-%d.log", datePrefix, logNum)
+		logPath := filepath.Join(logsDir, filename)
+		
+		// Check if file exists
+		if _, err := os.Stat(logPath); os.IsNotExist(err) {
+			// File doesn't exist, use this number
+			l.logFilePath = logPath
+			break
+		}
+		logNum++
+	}
+
+	// Open/create log file
+	var err error
+	l.logFile, err = os.OpenFile(l.logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		// If we can't open the file, log to stderr and continue without file logging
+		fmt.Fprintf(os.Stderr, "Warning: Failed to open log file %s: %v\n", l.logFilePath, err)
+		l.logFile = nil
+		return
+	}
+}
+
+// writeToFile writes a log entry to the file
+func (l *Logger) writeToFile(levelStr, message string) {
+	l.logFileMu.Lock()
+	defer l.logFileMu.Unlock()
+
+	if l.logFile == nil {
+		return
+	}
+
+	// Format: YYYY-MM-DD HH:MM:SS LEVEL [prefix] message
+	now := time.Now()
+	timestamp := now.Format("2006-01-02 15:04:05")
+	
+	prefix := ""
+	if l.prefix != "" {
+		prefix = fmt.Sprintf("[%s] ", l.prefix)
+	}
+	
+	// Pad level to 5 characters to match stdout format
+	paddedLevel := fmt.Sprintf("%-5s", levelStr)
+	logLine := fmt.Sprintf("%s %s%s %s\n", timestamp, paddedLevel, prefix, message)
+	
+	// Write to file (ignore errors to avoid disrupting normal operation)
+	_, _ = l.logFile.WriteString(logLine)
+}
+
+// Close closes the log file
+func (l *Logger) Close() error {
+	l.logFileMu.Lock()
+	defer l.logFileMu.Unlock()
+
+	if l.logFile != nil {
+		err := l.logFile.Close()
+		l.logFile = nil
+		return err
+	}
+	return nil
 }
 
 func (l *Logger) log(level Level, levelStr string, format string, args ...interface{}) {
@@ -107,6 +195,9 @@ func (l *Logger) log(level Level, levelStr string, format string, args ...interf
 			message,
 		)
 	}
+	
+	// Write to file (in addition to stdout/TUI)
+	l.writeToFile(levelStr, message)
 }
 
 // Tool logs tool execution with distinct formatting
@@ -141,6 +232,9 @@ func (l *Logger) Tool(format string, args ...interface{}) {
 			color.New(color.FgWhite).Sprintf(message),
 		)
 	}
+	
+	// Write to file (in addition to stdout/TUI)
+	l.writeToFile("TOOL", message)
 }
 
 func (l *Logger) Debug(format string, args ...interface{}) {
@@ -166,6 +260,16 @@ func (l *Logger) WithPrefix(prefix string) *Logger {
 	} else {
 		newPrefix = prefix
 	}
-	return New(l.level, newPrefix)
+	// Create new logger without initializing a new log file
+	// Share the same log file with the parent logger
+	newLogger := &Logger{
+		level:       l.level,
+		prefix:      newPrefix,
+		useTUI:      l.useTUI,
+		tuiBackend:  l.tuiBackend,
+		logFile:     l.logFile,
+		logFilePath: l.logFilePath,
+	}
+	return newLogger
 }
 

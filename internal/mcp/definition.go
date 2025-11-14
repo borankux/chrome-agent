@@ -73,11 +73,18 @@ type StatusReport struct {
 
 // MCPClientConfig represents the MCP client configuration format
 type MCPClientConfig struct {
-	MCPServers map[string]struct {
-		URL     string            `json:"url,omitempty"`
-		Command []string          `json:"command,omitempty"`
-		Env     map[string]string `json:"env,omitempty"`
-	} `json:"mcpServers,omitempty"`
+	MCPServers map[string]json.RawMessage `json:"mcpServers,omitempty"`
+}
+
+// MCPServerConfig represents a single MCP server configuration
+// Supports both formats:
+// 1. command as array: {"command": ["npx", "@playwright/mcp"]}
+// 2. command as string + args: {"command": "npx", "args": ["@playwright/mcp"]}
+type MCPServerConfig struct {
+	URL     string            `json:"url,omitempty"`
+	Command interface{}       `json:"command,omitempty"` // Can be string or []string
+	Args    []string          `json:"args,omitempty"`    // Used when command is a string
+	Env     map[string]string `json:"env,omitempty"`
 }
 
 // LoadDefinition loads and parses MCP JSON definition from file
@@ -93,16 +100,18 @@ func LoadDefinition(path string) (*MCPDefinition, error) {
 	if err := json.Unmarshal(data, &clientConfig); err == nil && len(clientConfig.MCPServers) > 0 {
 		// Extract first server configuration
 		var serverName string
-		var serverConfig struct {
-			URL     string            `json:"url,omitempty"`
-			Command []string          `json:"command,omitempty"`
-			Env     map[string]string `json:"env,omitempty"`
-		}
+		var serverConfigRaw json.RawMessage
 		
 		for name, config := range clientConfig.MCPServers {
 			serverName = name
-			serverConfig = config
+			serverConfigRaw = config
 			break
+		}
+
+		// Parse server config (supports both command formats)
+		var serverConfig MCPServerConfig
+		if err := json.Unmarshal(serverConfigRaw, &serverConfig); err != nil {
+			return nil, fmt.Errorf("failed to parse server config: %w", err)
 		}
 
 		// Convert to server definition format
@@ -120,15 +129,42 @@ func LoadDefinition(path string) (*MCPDefinition, error) {
 					URL: serverConfig.URL,
 				},
 			}
-		} else if len(serverConfig.Command) > 0 {
-			// Stdio transport
+		} else {
+			// Stdio transport - handle both command formats
+			var command []string
+			
+			if serverConfig.Command != nil {
+				switch cmd := serverConfig.Command.(type) {
+				case string:
+					// Format: {"command": "npx", "args": ["@playwright/mcp"]}
+					command = []string{cmd}
+					if len(serverConfig.Args) > 0 {
+						command = append(command, serverConfig.Args...)
+					}
+				case []interface{}:
+					// Format: {"command": ["npx", "@playwright/mcp"]}
+					command = make([]string, len(cmd))
+					for i, v := range cmd {
+						if str, ok := v.(string); ok {
+							command[i] = str
+						} else {
+							return nil, fmt.Errorf("command array must contain strings")
+						}
+					}
+				default:
+					return nil, fmt.Errorf("command must be a string or array of strings")
+				}
+			}
+
+			if len(command) == 0 {
+				return nil, fmt.Errorf("no transport configuration found in client config")
+			}
+
 			def.Transport = TransportConfig{
 				Type:    "stdio",
-				Command: serverConfig.Command,
+				Command: command,
 				Env:     serverConfig.Env,
 			}
-		} else {
-			return nil, fmt.Errorf("no transport configuration found in client config")
 		}
 
 		// Tools will be fetched from server during connection
@@ -188,7 +224,7 @@ func FormatStatusReport(report StatusReport) string {
 		statusIcon = "✗"
 	}
 
-	output := fmt.Sprintf("\n=== MCP Server Status Report ===\n")
+	output := "\n=== MCP Server Status Report ===\n"
 	output += fmt.Sprintf("Status: %s %s\n", statusIcon, map[bool]string{true: "Connected", false: "Disconnected"}[report.Connected])
 	output += fmt.Sprintf("Server: %s\n", report.ServerName)
 	output += fmt.Sprintf("Version: %s\n", report.Version)

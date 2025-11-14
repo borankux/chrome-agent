@@ -1,0 +1,23 @@
+Evaluate MCP server health:
+
+MCP Health Status: %s
+Consecutive Failures: %d
+Reconnection Attempts: %d
+Time Since Last Success: %v
+Objective: %s
+Task Progress: %s
+
+Execution Context:
+%s
+
+What should we do?
+- Continue if MCP is healthy or failures are transient?
+- Retry connection if server may be temporarily unavailable?
+- Stop task if MCP is dead and cannot be recovered?
+
+Consider:
+- If failures are recent and few, may be transient
+- If many failures after reconnection attempts, server likely dead
+- If task is near completion, may be worth waiting
+- If task just started, better to stop early
+

@@ -264,48 +264,53 @@ func FormatDuration(seconds float64) string {
 	return fmt.Sprintf("%.1f hours", seconds/3600)
 }
 
-// ParseTaskOrPlan parses task file and uses LLM planning if no subtasks are found
+// ParseTaskResult contains both the task spec and todos
+type ParseTaskResult struct {
+	Spec  *TaskSpec
+	Todos []*PlanTodo
+}
+
+// ParseTaskOrPlan reads raw input from task file and always uses LLM planning
+// LLM is the only way to parse tasks - hard-coded parsing has been removed
 func ParseTaskOrPlan(path string, llmCoord *llm.Coordinator, mcpClient *mcp.Client, log *logger.Logger) (*TaskSpec, error) {
-	// First, try to parse the task file
-	taskSpec, err := ParseTaskFile(path)
+	result, err := ParseTaskOrPlanWithTodos(path, llmCoord, mcpClient, log)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse task file: %w", err)
+		return nil, err
+	}
+	return result.Spec, nil
+}
+
+// ParseTaskOrPlanWithTodos reads raw input from task file and returns both spec and todos
+func ParseTaskOrPlanWithTodos(path string, llmCoord *llm.Coordinator, mcpClient *mcp.Client, log *logger.Logger) (*ParseTaskResult, error) {
+	// Read raw input from task file
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read task file: %w", err)
 	}
 
-	// If subtasks are already defined, use the parsed spec
-	if len(taskSpec.SubtaskRules) > 0 {
-		log.Info("Found %d manually defined subtasks, using parsed task specification", len(taskSpec.SubtaskRules))
-		return taskSpec, nil
+	// Use entire file content as the task prompt (no extraction logic)
+	taskContent := string(data)
+	if strings.TrimSpace(taskContent) == "" {
+		return nil, fmt.Errorf("task file is empty")
 	}
 
-	// If no subtasks found but we have an objective, use LLM planning
-	if taskSpec.Objective == "" {
-		return nil, fmt.Errorf("no objective found in task file and no subtasks defined")
-	}
-
-	log.Info("No subtasks found in task file, using LLM to plan task from objective")
+	log.Info("Using LLM to plan task from task file content")
+	log.Debug("Task content: %s", taskContent)
 	
-	// Create planner and plan the task
+	// Create planner and plan the task using LLM
 	planner := NewPlanner(llmCoord, mcpClient, log)
-	plannedSpec, err := planner.PlanTask(taskSpec.Objective)
+	plannedSpec, err := planner.PlanTask(taskContent)
 	if err != nil {
-		log.Warn("LLM planning failed: %v, falling back to parsed task specification", err)
-		// Return the original spec (may have loop condition or exception rules)
-		return taskSpec, nil
+		// LLM planning failed after retries - return error (task will be marked failed)
+		return nil, fmt.Errorf("LLM planning failed after retries: %w", err)
 	}
 
-	// Merge any manually defined loop conditions or exception rules from the parsed file
-	if taskSpec.LoopCondition != nil && plannedSpec.LoopCondition == nil {
-		plannedSpec.LoopCondition = taskSpec.LoopCondition
-		log.Info("Using manually defined loop condition from task file")
-	}
+	// Generate todos from the plan
+	todos := planner.GetTodos()
 
-	if len(taskSpec.ExceptionRules) > 0 {
-		// Merge exception rules (manual ones take precedence)
-		plannedSpec.ExceptionRules = append(taskSpec.ExceptionRules, plannedSpec.ExceptionRules...)
-		log.Info("Merged %d manually defined exception rules", len(taskSpec.ExceptionRules))
-	}
-
-	return plannedSpec, nil
+	return &ParseTaskResult{
+		Spec:  plannedSpec,
+		Todos: todos,
+	}, nil
 }
 
